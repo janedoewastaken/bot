@@ -908,6 +908,15 @@ class AllianceHubView(discord.ui.View):
             missing_label="Alliance Members",
         )
 
+    @discord.ui.button(label="Labyrinth", emoji=theme.listIcon,
+                       style=discord.ButtonStyle.secondary, row=3)
+    async def labyrinth_leaderboard(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _route_to_cog(
+            interaction, self.cog.bot, "AllianceMemberOperations",
+            "show_labyrinth_leaderboard_for", self.alliance_id,
+            missing_label="Alliance Members",
+        )
+
     # ── Nav (row 4) ──
 
     @discord.ui.button(label="Back", emoji=theme.backIcon,

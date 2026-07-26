@@ -1,0 +1,12 @@
+{
+  "description": "Labyrinth leaderboard page 1 — podium + ranks 4-9 and pinned self row 29.",
+  "event_type": "labyrinth_leaderboard",
+  "legion": null,
+  "header_date": null,
+  "min_rows": 8,
+  "expected_rows": [
+    {"name": "MONI", "value": 1909, "min_status": "needs_review"},
+    {"name": "Cocoa", "value": 1803, "min_status": "needs_review"},
+    {"name": "Jane", "value": 1545, "min_status": "needs_review"}
+  ]
+}

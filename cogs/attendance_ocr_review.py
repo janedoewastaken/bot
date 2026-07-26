@@ -23,6 +23,8 @@ from .attendance_ocr_parsers import (
     assign_unique_fids,
     update_users_combat_power,
     update_users_power,
+    update_users_labyrinth_stages,
+    save_labyrinth_snapshot,
     _record_attendance_row,
     _upsert_attendance_row,
     _mark_registered_as_absent,
@@ -191,7 +193,8 @@ class EventReviewView(discord.ui.View):
     @property
     def zero_is_absent(self) -> bool:
         """0-point result = absent (Foundry/Canyon); not for power/simple events."""
-        return not self.simple and not getattr(self.session, "power_only_snapshot", False)
+        return not self.simple and not getattr(self.session, "power_only_snapshot", False) \
+            and not getattr(self.session, "stages_only_snapshot", False)
 
     def _global_to_local(self, global_idx: int) -> tuple[list[dict], int]:
         if global_idx < len(self.registered_rows):
@@ -291,6 +294,14 @@ class EventReviewView(discord.ui.View):
                 f"{theme.infoIcon} **Power snapshot** — Submit updates each matched "
                 f"player's Power. Unmatched rows are skipped; no attendance is recorded."
             )
+        if getattr(self.session, "stages_only_snapshot", False):
+            return (
+                f"{theme.infoIcon} **State leaderboard snapshot** — Submit saves "
+                f"**all parsed ranks** (every alliance on your state). Your roster "
+                f"members are matched by name; `[TAG]` prefixes are stripped for matching "
+                f"and stored as the player's alliance. When a prior snapshot exists, "
+                f"known ranks help correct OCR mistakes."
+            )
         if self.simple:
             return (
                 f"{theme.infoIcon} **Scored players** — everyone in the alliance "
@@ -364,6 +375,14 @@ class EventReviewView(discord.ui.View):
                     f"\n{theme.warnIcon} **Event time not set** — use the "
                     f"**Time** button to pick a UTC slot ({', '.join(allowed)})."
                 )
+        cfg = EVENT_TYPES.get(self.session.event_type)
+        if cfg and cfg.legion_required and not self.session.detected_legion:
+            desc_lines.append(
+                f"\n{theme.warnIcon} **Legion not detected** — include the "
+                f"result-mail header (congratulations / scoreboard page) in your "
+                f"upload, or set legion via **Edit Event Info**. Without it, "
+                f"Legion 2 results won't show under the correct session."
+            )
         # Status counts up top where they're actually seen (was an easily-missed
         # footer). Lists what still needs the admin's attention before submit.
         attention = self._build_footer_bits()
@@ -456,13 +475,19 @@ class EventReviewView(discord.ui.View):
             absent = is_result and self.zero_is_absent and not r["value"]
             icon = theme.deniedIcon if absent else _STATUS_ICON.get(r["status"], "")
             if r["status"] in ("auto", "manual") and r["fid"]:
-                player = f"`{_isolate_rtl(r['nickname'])}` · `{r['fid']}`"
+                tag_bit = f"[{r['alliance_tag']}] " if r.get("alliance_tag") else ""
+                player = f"`{_isolate_rtl(tag_bit + r['nickname'])}` · `{r['fid']}`"
             elif r["status"] in ("likely", "review") and r["fid"]:
-                player = f"`{_isolate_rtl(r['nickname'])}` ({r['status']}) · `{r['fid']}`"
+                tag_bit = f"[{r['alliance_tag']}] " if r.get("alliance_tag") else ""
+                player = (
+                    f"`{_isolate_rtl(tag_bit + r['nickname'])}` ({r['status']}) · `{r['fid']}`"
+                )
             else:
-                player = f"`{_isolate_rtl(r['name'])}` — no match"
+                tag_bit = f"[{r['alliance_tag']}] " if r.get("alliance_tag") else ""
+                player = f"`{_isolate_rtl(tag_bit + r['name'])}` — no match"
             tail = "`Absent`" if absent else f"`{_format_int(r['value'])}`"
-            line = _ltr_line(f"**#{i}** {icon} {player} — {tail}")
+            rank_display = r.get("rank") if r.get("rank") is not None else i
+            line = _ltr_line(f"**#{rank_display}** {icon} {player} — {tail}")
             if budget_remaining - len(line) - 1 < 0:
                 break  # rest is on the next page — pagination, not a truncation note
             desc_lines.append(line)
@@ -759,6 +784,7 @@ class EventReviewView(discord.ui.View):
             self.add_item(toggle)
         # A power snapshot has no event fields but the date — label it plainly.
         header_label = ("Set Date" if getattr(self.session, "power_only_snapshot", False)
+                        or getattr(self.session, "stages_only_snapshot", False)
                         else "Edit Event Info")
         for label, emoji, style, cb in (
             ("Add Row", theme.addIcon, discord.ButtonStyle.secondary, self._on_add_row),
@@ -951,18 +977,34 @@ class EventReviewView(discord.ui.View):
 
     async def _on_submit(self, interaction: discord.Interaction):
         try:
+            await interaction.response.defer()
+        except (discord.NotFound, discord.HTTPException, discord.InteractionResponded):
+            return
+        try:
             session_id, absent_rows = self._persist()
         except Exception as e:
             logger.exception("EventReview submit failed")
-            await interaction.response.send_message(
-                f"{theme.deniedIcon} Submit failed: {e}", ephemeral=True,
-            )
+            try:
+                await interaction.followup.send(
+                    f"{theme.deniedIcon} Submit failed: {e}", ephemeral=True,
+                )
+            except (discord.NotFound, discord.HTTPException):
+                pass
             return
         if getattr(self.session, "power_only_snapshot", False):
             embed = self._build_power_snapshot_embed()
+        elif getattr(self.session, "stages_only_snapshot", False):
+            embed = self._build_stages_snapshot_embed()
         else:
             embed = self._build_scoreboard_embed(session_id, absent_rows)
-        await interaction.response.edit_message(embed=embed, view=None)
+        try:
+            await interaction.edit_original_response(embed=embed, view=None)
+        except (discord.NotFound, discord.HTTPException):
+            if self.session.progress_message:
+                try:
+                    await self.session.progress_message.edit(embed=embed, view=None)
+                except (discord.NotFound, discord.HTTPException):
+                    pass
         self.session.cog.end_session(self.session.channel.id, self.session.uploader_id)
         self.stop()
 
@@ -993,6 +1035,9 @@ class EventReviewView(discord.ui.View):
         # matched rows and record no attendance.
         if getattr(self.session, "power_only_snapshot", False):
             return self._persist_power_snapshot(ts), []
+
+        if getattr(self.session, "stages_only_snapshot", False):
+            return self._persist_stages_snapshot(ts), []
 
         if self.mode == "registration":
             return self._persist_registration_only(update_fn, ts), []
@@ -1086,6 +1131,24 @@ class EventReviewView(discord.ui.View):
                 learn_name_alias(self.session.alliance_id, r["name"], r["fid"])
                 count += 1
         self._power_updated_count = count
+        return None
+
+    def _persist_stages_snapshot(self, ts: str) -> Optional[str]:
+        """Labyrinth: save full state leaderboard; update alliance members matched."""
+        count = 0
+        for r in self.result_rows:
+            if r["fid"]:
+                update_users_labyrinth_stages(r["fid"], r["value"], ts)
+                learn_name_alias(self.session.alliance_id, r["name"], r["fid"])
+                count += 1
+        save_labyrinth_snapshot(
+            self.session.alliance_id,
+            self.session.detected_date,
+            self.result_rows,
+            ts,
+        )
+        self._stages_updated_count = count
+        self._labyrinth_rank_count = len(self.result_rows)
         return None
 
     def _persist_registration_only(self, update_fn, ts: str) -> str:
@@ -1257,6 +1320,29 @@ class EventReviewView(discord.ui.View):
         desc.append(f"{theme.lowerDivider}")
         return discord.Embed(
             title=f"{theme.verifiedIcon} {label} — Power Recorded",
+            description="\n".join(desc),
+            color=theme.emColor1,
+        )
+
+    def _build_stages_snapshot_embed(self) -> discord.Embed:
+        cfg = EVENT_TYPES.get(self.session.event_type)
+        label = cfg.label if cfg else self.session.event_type
+        updated = getattr(self, "_stages_updated_count", 0)
+        total = getattr(self, "_labyrinth_rank_count", len(self.result_rows))
+        unmatched = [r for r in self.result_rows if not r["fid"]]
+        desc = [
+            f"{theme.upperDivider}",
+            f"{theme.chartIcon} **{total}** state ranks saved "
+            f"({updated} matched to your alliance roster).",
+        ]
+        if unmatched:
+            desc.append(
+                f"{theme.infoIcon} Other-alliance players are stored in the snapshot "
+                f"but do not update your roster."
+            )
+        desc.append(f"{theme.lowerDivider}")
+        return discord.Embed(
+            title=f"{theme.verifiedIcon} {label} — Snapshot Recorded",
             description="\n".join(desc),
             color=theme.emColor1,
         )
@@ -1726,10 +1812,11 @@ class _EditEventInfoModal(discord.ui.Modal):
     def __init__(self, view: EventReviewView):
         session = view.session
         power_only = getattr(session, "power_only_snapshot", False)
-        super().__init__(title="Set Date" if power_only else "Edit Event Info")
+        stages_only = getattr(session, "stages_only_snapshot", False)
+        super().__init__(title="Set Date" if (power_only or stages_only) else "Edit Event Info")
         self.view = view
         self.date_input = discord.ui.TextInput(
-            label="Snapshot date (YYYY-MM-DD)" if power_only else "Event date (YYYY-MM-DD)",
+            label="Snapshot date (YYYY-MM-DD)" if (power_only or stages_only) else "Event date (YYYY-MM-DD)",
             default=session.detected_date.isoformat() if session.detected_date else "",
             required=False, max_length=10,
         )

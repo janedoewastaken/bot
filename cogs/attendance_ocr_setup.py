@@ -162,6 +162,33 @@ def set_ocr_upload_admin_only(alliance_id: int, value: bool) -> None:
         conn.commit()
 
 
+DEFAULT_OCR_SESSION_TIMEOUT_MIN = 15
+
+
+def get_ocr_session_timeout_min(alliance_id: int) -> int:
+    """Minutes to wait for more screenshots before auto-finalising (1–60)."""
+    with sqlite3.connect("db/alliance.sqlite", timeout=30.0) as conn:
+        row = conn.execute(
+            "SELECT ocr_session_timeout_min FROM alliancesettings WHERE alliance_id = ?",
+            (alliance_id,),
+        ).fetchone()
+    if row and row[0] is not None:
+        return int(row[0])
+    return DEFAULT_OCR_SESSION_TIMEOUT_MIN
+
+
+def set_ocr_session_timeout_min(alliance_id: int, minutes: int) -> None:
+    with sqlite3.connect("db/alliance.sqlite", timeout=30.0) as conn:
+        conn.execute(
+            "INSERT INTO alliancesettings (alliance_id, ocr_session_timeout_min) "
+            "VALUES (?, ?) "
+            "ON CONFLICT(alliance_id) DO UPDATE SET "
+            "ocr_session_timeout_min = excluded.ocr_session_timeout_min",
+            (alliance_id, int(minutes)),
+        )
+        conn.commit()
+
+
 def find_conflicting_channel_owner(channel_id: int, requesting_alliance_id: int) -> Optional[tuple[str, int, str]]:
     """Return (feature, alliance_id, alliance_name) of the alliance that
     already claims this channel for OCR (Bear or Screenshot Upload), or
@@ -203,8 +230,9 @@ def format_channel_conflict(conflict: tuple[str, int, str], channel_mention: str
 _EVENT_LOCATIONS: dict[str, str] = {
     "foundry_battle":    "Mail → Alliance → [Foundry Battle] Registration Ends *and* Results",
     "canyon_clash":      "Mail → Alliance → [Canyon Clash] Solo Participation *and* Legion X Battle Result",
-    "power_rankings":    "Alliance → Power Rankings",
-    "alliance_showdown": "Mail → Alliance → Alliance Showdown Ranking",
+    "power_rankings":        "Alliance → Power Rankings",
+    "labyrinth_leaderboard": "The Labyrinth → Leaderboard",
+    "alliance_showdown":     "Mail → Alliance → Alliance Showdown Ranking",
 }
 
 
@@ -217,7 +245,9 @@ def render_info_message(channel_id: int) -> str:
         )
 
     settings = get_channel_settings(channel_id) or {}
-    admin_only = get_ocr_upload_admin_only(settings.get("alliance_id", 0))
+    alliance_id = settings.get("alliance_id", 0)
+    admin_only = get_ocr_upload_admin_only(alliance_id)
+    timeout_min = get_ocr_session_timeout_min(alliance_id)
 
     lines = [
         f"{theme.importIcon} **Upload event screenshots here**",
@@ -250,8 +280,22 @@ def render_info_message(channel_id: int) -> str:
     lines.append("• OCR isn't perfect; review and edit the parsed data before submitting.")
     lines.append("• Save your current event before starting the next upload.")
     lines.append(
-        f"• Set your in-game interface language to **English** before "
-        f"taking screenshots — other languages aren't supported yet."
+        f"• You have **{timeout_min} minutes** after each upload to add more screenshots; "
+        "click **Done Uploading** when finished."
+    )
+    if "labyrinth_leaderboard" in enabled:
+        lines.append(
+            "• **Labyrinth:** scroll the full state leaderboard (ranks 1–100, all alliances) "
+            "and upload every page — about 15–18 screenshots. The first must include the "
+            "**top-3 podium**."
+        )
+    lines.append(
+        "• `[TAG]` alliance prefixes (e.g. `[BUL]Name`) are stripped automatically "
+        "when matching to your roster."
+    )
+    lines.append(
+        "• Set your in-game interface language to **English** before "
+        "taking screenshots — other languages aren't supported yet."
     )
     lines.append(f"{theme.lowerDivider}")
     lines.append("")
@@ -608,6 +652,7 @@ class OCRChannelEditView(discord.ui.View):
         enabled = self._enabled_events()
         settings = get_channel_settings(self.channel_id) or {}
         admin_only = get_ocr_upload_admin_only(self.alliance_id)
+        timeout_min = get_ocr_session_timeout_min(self.alliance_id)
         post_on = bool(settings.get("post_info_message"))
         pin_on = bool(settings.get("pin_info_message"))
 
@@ -646,6 +691,10 @@ class OCRChannelEditView(discord.ui.View):
         lines.append(f"{theme.lockIcon} **Uploaders:** {uploaders_state}")
         lines.append("└ Per-alliance setting — applies to every Screenshot Upload "
                      f"channel for `{_alliance_name(self.alliance_id)}`")
+        lines.append("")
+        lines.append(f"{theme.hourglassIcon} **Session timeout:** {timeout_min} min")
+        lines.append("└ Minutes to wait for more screenshots before opening review "
+                     "(resets after each upload)")
         lines.append("")
         auto_delete_on = bool(settings.get("auto_delete_screenshots", True))
         lines.append(
@@ -726,6 +775,15 @@ class OCRChannelEditView(discord.ui.View):
         auto_delete_btn.callback = self._toggle_auto_delete
         self.add_item(auto_delete_btn)
 
+        timeout_btn = discord.ui.Button(
+            label=f"Session timeout: {get_ocr_session_timeout_min(self.alliance_id)} min",
+            emoji=theme.hourglassIcon,
+            style=discord.ButtonStyle.primary,
+            row=2,
+        )
+        timeout_btn.callback = self._session_timeout
+        self.add_item(timeout_btn)
+
         keywords_btn = discord.ui.Button(
             label="Edit Keywords", emoji=theme.editListIcon,
             style=discord.ButtonStyle.primary, row=2,
@@ -742,7 +800,7 @@ class OCRChannelEditView(discord.ui.View):
 
         back_btn = discord.ui.Button(
             label="Back", emoji=theme.backIcon,
-            style=discord.ButtonStyle.secondary, row=2,
+            style=discord.ButtonStyle.secondary, row=3,
         )
         back_btn.callback = self._back
         self.add_item(back_btn)
@@ -807,6 +865,15 @@ class OCRChannelEditView(discord.ui.View):
         set_auto_delete_screenshots(self.channel_id, not current)
         self._build_components()
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _session_timeout(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(
+            OcrSessionTimeoutModal(
+                self.alliance_id,
+                get_ocr_session_timeout_min(self.alliance_id),
+                self,
+            )
+        )
 
     async def _open_keywords(self, interaction: discord.Interaction):
         view = _KeywordsView(
@@ -990,3 +1057,39 @@ class _KeywordsModal(discord.ui.Modal):
         # the fingerprint regex takes over as the sole classifier.
         set_event_keywords(self.parent.channel_id, self.event_type, keywords)
         await self.parent.reload(interaction)
+
+
+class OcrSessionTimeoutModal(discord.ui.Modal):
+    def __init__(self, alliance_id: int, current_timeout: int,
+                 parent_view: OCRChannelEditView):
+        super().__init__(title="Set Session Timeout")
+        self.alliance_id = alliance_id
+        self.parent_view = parent_view
+
+        self.timeout_input = discord.ui.TextInput(
+            label="Minutes to wait for more screenshots (1-60)",
+            placeholder="e.g. 15",
+            default=str(current_timeout),
+            required=True,
+            max_length=3,
+        )
+        self.add_item(self.timeout_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            minutes = int(self.timeout_input.value.strip())
+            if not (1 <= minutes <= 60):
+                raise ValueError
+        except ValueError:
+            await interaction.response.send_message(
+                f"{theme.deniedIcon} Please enter a whole number between 1 and 60.",
+                ephemeral=True,
+            )
+            return
+
+        set_ocr_session_timeout_min(self.alliance_id, minutes)
+        await self.parent_view.cog.refresh_info_message(self.parent_view.channel_id)
+        self.parent_view._build_components()
+        embed = self.parent_view.build_embed()
+        embed.description += f"\n{theme.verifiedIcon} Session timeout set to {minutes} min."
+        await interaction.response.edit_message(embed=embed, view=self.parent_view)

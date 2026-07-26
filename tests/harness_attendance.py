@@ -102,6 +102,10 @@ _FIXTURE_META: dict[str, tuple[str, Optional[str]]] = {
     "power_rankings_011.png": ("power_rankings", None),
     "power_rankings_012.png": ("power_rankings", None),
     "power_rankings_013.png": ("power_rankings", None),
+    "labyrinth_leaderboard_001.png": ("labyrinth_leaderboard", None),
+    "labyrinth_leaderboard_002.png": ("labyrinth_leaderboard", None),
+    "labyrinth_leaderboard_003.png": ("labyrinth_leaderboard", None),
+    "labyrinth_leaderboard_004.png": ("labyrinth_leaderboard", None),
     # Registration mails for foundry/canyon now classify under the unified
     # event_type (foundry_battle / canyon_clash) — the per-screenshot
     # "kind" is what distinguishes registration from result data inside a

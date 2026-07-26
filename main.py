@@ -1185,6 +1185,8 @@ if __name__ == "__main__":
                 ("power_updated_at",        "TEXT"),
                 ("combat_power",            "INTEGER"),
                 ("combat_power_updated_at", "TEXT"),
+                ("labyrinth_stages",        "INTEGER"),
+                ("labyrinth_stages_updated_at", "TEXT"),
                 ("discord_id",              "INTEGER"),
                 ("discord_server_id",       "INTEGER"),
                 ("discord_id_updated_at",   "TEXT"),
@@ -1234,6 +1236,14 @@ if __name__ == "__main__":
             except sqlite3.OperationalError:
                 conn_alliance.execute(
                     "ALTER TABLE alliancesettings ADD COLUMN silent_notifications INTEGER DEFAULT 0"
+                )
+
+            # Minutes to wait for more screenshots before auto-finalising an OCR upload.
+            try:
+                conn_alliance.execute("SELECT ocr_session_timeout_min FROM alliancesettings LIMIT 1")
+            except sqlite3.OperationalError:
+                conn_alliance.execute(
+                    "ALTER TABLE alliancesettings ADD COLUMN ocr_session_timeout_min INTEGER DEFAULT 15"
                 )
 
             conn_alliance.execute("""CREATE TABLE IF NOT EXISTS alliance_list (

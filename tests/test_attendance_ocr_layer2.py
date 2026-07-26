@@ -63,6 +63,11 @@ def _parse_rows_for_event(ocr_text: str, event_type: str) -> list[dict]:
             {"name": r["name"], "value": r["power"]}
             for r in parsers._parse_power_rows(ocr_text)
         ]
+    if event_type == "labyrinth_leaderboard":
+        return [
+            {"name": r["name"], "value": r["stages"], "rank": r.get("rank")}
+            for r in parsers._parse_labyrinth_rows(ocr_text)
+        ]
     return parsers._parse_player_value_rows(ocr_text)
 
 

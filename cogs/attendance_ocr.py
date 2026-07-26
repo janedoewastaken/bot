@@ -206,7 +206,10 @@ class AttendanceOCR(commands.Cog):
 
         key = (message.channel.id, message.author.id)
         session = self.active_sessions.get(key)
-        if session is not None and not session.finalized and not session.cancelled:
+        if session is not None and not session.cancelled:
+            if session.finalized:
+                # More screenshots while review is still open — keep one session.
+                await session.reopen_for_more_uploads()
             await session.add_attachments(images)
             await self._maybe_delete_source(message, settings)
             return

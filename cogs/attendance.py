@@ -53,6 +53,7 @@ _OCR_EVENT_DISPLAY = {
     "canyon_clash": ("Canyon Clash", "⚔️"),
     "alliance_showdown": ("Alliance Showdown", "🛡️"),
     "power_rankings": ("Power Rankings", "📊"),
+    "labyrinth_leaderboard": ("Labyrinth Leaderboard", "🌀"),
 }
 
 

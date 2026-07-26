@@ -89,6 +89,17 @@ EVENT_TYPES: dict[str, EventTypeConfig] = {
             "result": re.compile(r"(?:Alliance\s+Ranking|Power\s+Rankings)", re.IGNORECASE),
         },
     ),
+    "labyrinth_leaderboard": EventTypeConfig(
+        key="labyrinth_leaderboard",
+        label="Labyrinth Leaderboard",
+        default_keywords=("The Labyrinth", "Labyrinth"),
+        fingerprint_re_by_kind={
+            "result": re.compile(
+                r"(?:The\s+Labyrinth|Total\s+Stages)",
+                re.IGNORECASE,
+            ),
+        },
+    ),
     "alliance_showdown": EventTypeConfig(
         key="alliance_showdown",
         label="Alliance Showdown",
@@ -157,6 +168,27 @@ def resolve_event_date(mail_date_local: date, event_type: str,
 
 _HEADER_DATE_RE = re.compile(r"(?<!\d)(\d{4})[-./](\d{2})[-./](\d{2})(?!\d{3})")
 _LEGION_RE = re.compile(r"\[?\s*Legion\s+(\d)\s*\]?", re.IGNORECASE)
+# Prefer legion tied to *your* alliance / registration — scoreboard cards list
+# every alliance's legion and the first bare "Legion N" is often the winner
+# (Legion 1) even when you fought as Legion 2.
+_OWN_ALLIANCE_LEGION_RES: tuple[re.Pattern, ...] = (
+    re.compile(
+        r"(?:Congratulations,?\s*)?\[?\s*Legion\s+(\d)\s*\]?\s+of\s+your\s+alliance",
+        re.IGNORECASE,
+    ),
+    re.compile(r"your\s+alliance\s+\[?\s*Legion\s+(\d)\s*\]?", re.IGNORECASE),
+    re.compile(
+        r"for\s+\[?\s*Legion\s+(\d)\s*\]?\s+in\s+(?:\[)?(?:Foundry|Canyon)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\[?\s*Legion\s+(\d)\s*\]?\s+Please\s+get\s+ready", re.IGNORECASE),
+    re.compile(
+        r"selected\s+as\s+a?\s*combatant\s+for\s+\[?\s*Legion\s+(\d)\s*\]?",
+        re.IGNORECASE,
+    ),
+    re.compile(r"Legion\s+(\d)\s+Victory\b", re.IGNORECASE),
+    re.compile(r"Legion\s+(\d)\s+ranked\s+No\.?", re.IGNORECASE),
+)
 _SCOREBOARD_ID_RE = re.compile(r"#(\d{1,5})")
 _SCOREBOARD_NAME_RE = re.compile(r"\[([^\]]{1,8})\]\s*([^\d\[\n]{1,40}?)(?=\s*(?:\[|#|\d{1,3}(?:,\d{3})+|\d{4,}|Stats|MVP|Legion|$))")
 
@@ -221,8 +253,29 @@ def extract_header_date(ocr_text: str) -> Optional[date]:
 
 
 def extract_legion(ocr_text: str) -> Optional[str]:
+    for rx in _OWN_ALLIANCE_LEGION_RES:
+        m = rx.search(ocr_text)
+        if m:
+            return f"Legion {m.group(1)}"
     m = _LEGION_RE.search(ocr_text)
     return f"Legion {m.group(1)}" if m else None
+
+
+def infer_legion_from_scoreboard(
+    scoreboard: list[dict],
+    alliance_rank: Optional[int],
+) -> Optional[str]:
+    """Defeat mails omit the legion in the congratulations line — pair
+    alliance placement (1=win, 2=loss, …) with scoreboard cards sorted by score."""
+    if alliance_rank is None or not scoreboard:
+        return None
+    by_score = sorted(scoreboard, key=lambda r: -(r.get("score") or 0))
+    idx = alliance_rank - 1
+    if 0 <= idx < len(by_score):
+        legion = by_score[idx].get("legion")
+        if legion:
+            return legion
+    return None
 
 
 # ── result-mail extras: scoreboard, stats, MVPs ───────────────────────────
@@ -515,6 +568,7 @@ _PARSE_STOPWORDS = frozenset({
     "points", "point", "alliance", "showdown", "combatants", "substitutes",
     "page", "expires", "rewards", "stats", "mvp", "of", "your", "the", "in",
     "chief", "power", "ko", "contribution", "claimed", "no",
+    "stages", "stage", "labyrinth", "total",
 })
 
 # Section markers that mark the start of the player-row data. The parser
@@ -526,6 +580,7 @@ _SECTION_MARKERS = (
     "Combatants",
     "Chief Power",
     "Power Rankings",
+    "Total Stages",
     "Ranking",
 )
 
@@ -799,6 +854,262 @@ def _dedup_into(target: list[dict], new_row: dict) -> None:
     target.append(new_row)
 
 
+def _labyrinth_names_overlap(norm_a: str, norm_b: str) -> bool:
+    if not norm_a or not norm_b:
+        return False
+    return norm_a == norm_b or norm_a in norm_b or norm_b in norm_a
+
+
+def _labyrinth_stages_close(a: Optional[int], b: Optional[int]) -> bool:
+    if a is None or b is None:
+        return False
+    if a == b:
+        return True
+    return abs(a - b) <= max(3, int(a * 0.001))
+
+
+def _merge_labyrinth_row(old: dict, new: dict) -> dict:
+    """Merge two captures of the same player across scroll screenshots."""
+    pick_new_name = _cleaner_name(new.get("name") or "", old.get("name") or "")
+    name = new["name"] if pick_new_name else old["name"]
+    stages = max(old.get("stages") or 0, new.get("stages") or 0)
+    old_rank, new_rank = old.get("rank"), new.get("rank")
+    if old_rank is not None and new_rank is not None:
+        # OCR often reads 29 as 89 — when stages agree, trust the lower rank.
+        rank = min(old_rank, new_rank) if _labyrinth_stages_close(old.get("stages"), new.get("stages")) else (
+            old_rank if (old.get("stages") or 0) >= (new.get("stages") or 0) else new_rank
+        )
+    else:
+        rank = old_rank if old_rank is not None else new_rank
+    tag = new.get("alliance_tag") or old.get("alliance_tag")
+    return {
+        "rank": rank, "name": name, "stages": stages, "value": stages,
+        "alliance_tag": tag,
+    }
+
+
+def _dedup_labyrinth_into(target: list[dict], new_row: dict) -> None:
+    """Labyrinth dedup: same player by name first, then same rank on scroll overlap."""
+    new_norm = _normalize_for_match(new_row.get("name") or "")
+    new_stages = new_row.get("stages")
+
+    for i, r in enumerate(target):
+        if not _labyrinth_names_overlap(new_norm, _normalize_for_match(r.get("name") or "")):
+            continue
+        if _labyrinth_stages_close(new_stages, r.get("stages")):
+            target[i] = _merge_labyrinth_row(r, new_row)
+            return
+
+    new_rank = new_row.get("rank")
+    if new_rank is not None:
+        for i, r in enumerate(target):
+            if r.get("rank") != new_rank:
+                continue
+            if _labyrinth_names_overlap(
+                new_norm, _normalize_for_match(r.get("name") or "")
+            ):
+                target[i] = _merge_labyrinth_row(r, new_row)
+                return
+
+    _dedup_into(target, new_row)
+
+
+def _try_fix_labyrinth_rank_ocr(ocr_rank: int, implied: int, *, max_rank: int = 100) -> Optional[int]:
+    """Fix common single-digit OCR swaps (e.g. 29 read as 89)."""
+    if abs(ocr_rank - implied) <= 5:
+        return ocr_rank
+    best = ocr_rank
+    s = str(ocr_rank)
+    for old, new in (("8", "2"), ("2", "8"), ("3", "8"), ("5", "6"), ("6", "8")):
+        for i, ch in enumerate(s):
+            if ch != old:
+                continue
+            try:
+                candidate = int(s[:i] + new + s[i + 1:])
+            except ValueError:
+                continue
+            if 1 <= candidate <= max_rank and abs(candidate - implied) < abs(best - implied):
+                best = candidate
+    if best != ocr_rank and abs(best - implied) < abs(ocr_rank - implied):
+        return best
+    return None
+
+
+def _labyrinth_stage_span(rows: list[dict]) -> tuple[int, int]:
+    stages = [r["stages"] for r in rows]
+    return min(stages), max(stages)
+
+
+def _labyrinth_rank_stage_fit(row: dict, rk: int, rows: list[dict], *, max_rank: int = 100) -> float:
+    """How well this row's stages fit the given rank (lower = better)."""
+    min_s, max_s = _labyrinth_stage_span(rows)
+    if max_s <= min_s:
+        return 0.0
+    ideal_frac = (max_rank - rk) / max(max_rank - 1, 1)
+    ideal_s = min_s + (max_s - min_s) * ideal_frac
+    return abs(row["stages"] - ideal_s)
+
+
+def _labyrinth_rank_from_stage_position(row: dict, rows: list[dict]) -> int:
+    """1-based rank from position in the stage-sorted player list."""
+    ordered = sorted(rows, key=lambda r: (-r["stages"], r.get("rank") or 999))
+    for i, r in enumerate(ordered, start=1):
+        if r is row:
+            return i
+    return row.get("rank") or 1
+
+
+def _reconcile_labyrinth_rows(rows: list[dict], *, max_rank: int = 100,
+                              alliance_id: Optional[int] = None) -> list[dict]:
+    """Collapse duplicate players and fix rank OCR using stage ordering."""
+    if not rows:
+        return []
+
+    merged: list[dict] = []
+    for row in rows:
+        _dedup_labyrinth_into(merged, row)
+
+    by_rank: dict[int, list[dict]] = {}
+    for r in merged:
+        rk = r.get("rank")
+        if rk is not None:
+            by_rank.setdefault(rk, []).append(r)
+
+    for rk, group in by_rank.items():
+        if len(group) <= 1:
+            continue
+        group.sort(key=lambda r: _labyrinth_rank_stage_fit(r, rk, merged, max_rank=max_rank))
+        for r in group[1:]:
+            if len(merged) >= 10:
+                r["rank"] = _labyrinth_rank_from_stage_position(r, merged)
+            else:
+                r["rank"] = None
+
+    for r in merged:
+        rk = r.get("rank")
+        implied = _labyrinth_rank_from_stage_position(r, merged)
+        if rk is None:
+            r["rank"] = implied
+            continue
+        if len(merged) >= 10 and abs(rk - implied) >= 8:
+            fixed = _try_fix_labyrinth_rank_ocr(rk, implied, max_rank=max_rank)
+            r["rank"] = fixed if fixed is not None else implied
+
+    if alliance_id is not None:
+        snap = load_labyrinth_snapshot(alliance_id)
+        if snap and snap.get("rows"):
+            merged = _apply_labyrinth_history(merged, snap["rows"], max_rank=max_rank)
+
+    return sorted(merged, key=lambda r: (r.get("rank") is None, r.get("rank") or 999))
+
+
+def _build_labyrinth_history_index(history_rows: list[dict]) -> dict[str, dict]:
+    by_name: dict[str, dict] = {}
+    for h in history_rows:
+        norm = _normalize_for_match(h.get("name") or "")
+        if norm and norm not in by_name:
+            by_name[norm] = h
+    return by_name
+
+
+def _labyrinth_history_lookup(name: str, by_name: dict[str, dict]) -> Optional[dict]:
+    norm = _normalize_for_match(name or "")
+    if not norm:
+        return None
+    if norm in by_name:
+        return by_name[norm]
+    for hnorm, h in by_name.items():
+        if norm in hnorm or hnorm in norm:
+            return h
+    return None
+
+
+def _labyrinth_stages_consistent_with_history(current: int, historical: int) -> bool:
+    """Same event week: totals stay flat or rise; large drops mean a bad name match."""
+    if historical <= 0 or current <= 0:
+        return False
+    if current >= int(historical * 0.82):
+        return True
+    return abs(current - historical) <= max(120, int(historical * 0.18))
+
+
+def _apply_labyrinth_history(rows: list[dict], history_rows: list[dict],
+                             *, max_rank: int = 100) -> list[dict]:
+    """Use the last submitted snapshot to fix OCR rank drift and fill gaps."""
+    by_name = _build_labyrinth_history_index(history_rows)
+    if not by_name:
+        return rows
+
+    def _rank_map() -> dict[int, dict]:
+        out: dict[int, dict] = {}
+        for r in rows:
+            rk = r.get("rank")
+            if rk is not None:
+                out[int(rk)] = r
+        return out
+
+    for r in rows:
+        hist = _labyrinth_history_lookup(r.get("name") or "", by_name)
+        if not hist:
+            continue
+        hist_rank = hist.get("rank")
+        hist_stages = hist.get("stages") or hist.get("value")
+        if hist_rank is None or hist_stages is None:
+            continue
+        hist_rank = int(hist_rank)
+        if not (1 <= hist_rank <= max_rank):
+            continue
+        if not _labyrinth_stages_consistent_with_history(int(r["stages"]), int(hist_stages)):
+            continue
+        if not r.get("alliance_tag") and hist.get("alliance_tag"):
+            r["alliance_tag"] = hist["alliance_tag"]
+
+        ocr_rank = r.get("rank")
+        if ocr_rank is not None and abs(int(ocr_rank) - hist_rank) < 5:
+            continue
+
+        ranks = _rank_map()
+        occupant = ranks.get(hist_rank)
+        if occupant is not None and occupant is not r:
+            occ_hist = _labyrinth_history_lookup(occupant.get("name") or "", by_name)
+            if (occ_hist and int(occ_hist.get("rank", -1)) == hist_rank
+                    and _labyrinth_stages_consistent_with_history(
+                        int(occupant["stages"]),
+                        int(occ_hist.get("stages") or occ_hist.get("value") or 0),
+                    )):
+                continue
+            if occ_hist and occ_hist.get("rank") is not None:
+                occupant["rank"] = int(occ_hist["rank"])
+            else:
+                occupant["rank"] = None
+
+        r["rank"] = hist_rank
+
+    # Resolve any duplicate ranks left after history reassignment.
+    by_rank: dict[int, list[dict]] = {}
+    for r in rows:
+        rk = r.get("rank")
+        if rk is not None:
+            by_rank.setdefault(int(rk), []).append(r)
+
+    for rk, group in by_rank.items():
+        if len(group) <= 1:
+            continue
+        group.sort(key=lambda r: _labyrinth_rank_stage_fit(r, rk, rows, max_rank=max_rank))
+        for r in group[1:]:
+            hist = _labyrinth_history_lookup(r.get("name") or "", by_name)
+            if (hist and hist.get("rank") is not None
+                    and _labyrinth_stages_consistent_with_history(
+                        int(r["stages"]),
+                        int(hist.get("stages") or hist.get("value") or 0),
+                    )):
+                r["rank"] = int(hist["rank"])
+            else:
+                r["rank"] = _labyrinth_rank_from_stage_position(r, rows)
+
+    return rows
+
+
 def load_alliance_roster(alliance_id: int) -> list[tuple[int, str]]:
     with sqlite3.connect("db/users.sqlite", timeout=30.0) as conn:
         rows = conn.execute(
@@ -823,10 +1134,48 @@ def _skeleton(s: str) -> str:
 
 
 @functools.lru_cache(maxsize=8192)
+def _parse_alliance_tag_and_name(raw: str) -> tuple[str, Optional[str]]:
+    """Extract the first [TAG] alliance prefix and the player name after it.
+
+    OCR often prefixes junk before the tag (``6L [BUL]Name``, ``LL [NAH]Name``).
+    Everything before the first ``[...]`` is discarded."""
+    s = (raw or "").strip()
+    s = re.sub(r"<([^>]{1,12})>", r"[\1]", s)
+    m = re.search(r"\[([^\]]{1,8})\]", s)
+    if not m:
+        return _strip_leading_junk_prefix(s), None
+    tag = m.group(1).strip().upper()
+    name = s[m.end():].strip()
+    return name, tag
+
+
+def _strip_leading_junk_prefix(s: str) -> str:
+    """Drop OCR noise before a bare player name (no ``[TAG]`` on the row)."""
+    s = (s or "").strip()
+    s = re.sub(r"^<[^>]{1,12}>", "", s)
+    s = re.sub(r"^\[([^\]]{1,8})\]\s*", "", s)
+    s = re.sub(
+        r"^(?:[A-Z]{1,3}\d?|\d{1,2}[A-Z])\s+",
+        "",
+        s,
+        flags=re.IGNORECASE,
+    )
+    return s.strip()
+
+
+@functools.lru_cache(maxsize=8192)
+def _strip_leading_alliance_tag(s: str) -> str:
+    """Remove a leading [TAG] (or OCR misread <TAG>) alliance prefix."""
+    name, _tag = _parse_alliance_tag_and_name(s)
+    return name
+
+
+@functools.lru_cache(maxsize=8192)
 def _normalize_for_match(s: str) -> str:
     """Fold homoglyphs to Latin, lowercase, drop non-alphanumeric noise — so a
     decorated 'ROγAL' matches 'ROYAL'. Genuine non-Latin scripts (Arabic, CJK)
     have no Latin lookalike and pass through unchanged."""
+    s = _strip_leading_alliance_tag(s)
     return re.sub(r"[^\w]", "", _skeleton(s), flags=re.UNICODE).casefold()
 
 
@@ -986,9 +1335,140 @@ def update_users_combat_power(fid: int, combat_power: int, ts_iso: str) -> None:
         conn.commit()
 
 
+def update_users_labyrinth_stages(fid: int, stages: int, ts_iso: str) -> None:
+    with sqlite3.connect("db/users.sqlite", timeout=30.0) as conn:
+        conn.execute(
+            "UPDATE users SET labyrinth_stages = ?, labyrinth_stages_updated_at = ? "
+            "WHERE fid = ?",
+            (stages, ts_iso, fid),
+        )
+        conn.commit()
+
+
 # ── attendance session DB helpers ─────────────────────────────────────────
 
 _ATT_DB = "db/attendance.sqlite"
+
+
+def _init_labyrinth_snapshot_tables() -> None:
+    try:
+        with sqlite3.connect(_ATT_DB, timeout=30.0) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS labyrinth_snapshots (
+                    snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    alliance_id INTEGER NOT NULL,
+                    snapshot_date TEXT,
+                    created_at TEXT
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS labyrinth_snapshot_rows (
+                    snapshot_id INTEGER NOT NULL,
+                    rank INTEGER NOT NULL,
+                    player_name TEXT NOT NULL,
+                    stages INTEGER NOT NULL,
+                    matched_fid INTEGER,
+                    PRIMARY KEY (snapshot_id, rank)
+                )
+            """)
+            try:
+                conn.execute(
+                    "SELECT player_alliance_tag FROM labyrinth_snapshot_rows LIMIT 1"
+                )
+            except sqlite3.OperationalError:
+                conn.execute(
+                    "ALTER TABLE labyrinth_snapshot_rows "
+                    "ADD COLUMN player_alliance_tag TEXT"
+                )
+            conn.commit()
+    except Exception as e:
+        logger.warning(f"AttendanceOCR: could not init labyrinth snapshot tables: {e}")
+
+
+def save_labyrinth_snapshot(alliance_id: int, snapshot_date, rows: list[dict],
+                            ts_iso: str) -> int:
+    """Replace the alliance's prior snapshot with the full state leaderboard."""
+    with sqlite3.connect(_ATT_DB, timeout=30.0) as conn:
+        old = conn.execute(
+            "SELECT snapshot_id FROM labyrinth_snapshots WHERE alliance_id = ? "
+            "ORDER BY snapshot_id DESC LIMIT 1",
+            (int(alliance_id),),
+        ).fetchone()
+        if old:
+            conn.execute(
+                "DELETE FROM labyrinth_snapshot_rows WHERE snapshot_id = ?",
+                (old[0],),
+            )
+            conn.execute(
+                "DELETE FROM labyrinth_snapshots WHERE snapshot_id = ?",
+                (old[0],),
+            )
+        cur = conn.execute(
+            "INSERT INTO labyrinth_snapshots (alliance_id, snapshot_date, created_at) "
+            "VALUES (?, ?, ?)",
+            (int(alliance_id),
+             snapshot_date.isoformat() if snapshot_date else None,
+             ts_iso),
+        )
+        sid = cur.lastrowid
+        for r in rows:
+            rank = r.get("rank")
+            if rank is None:
+                continue
+            conn.execute(
+                "INSERT INTO labyrinth_snapshot_rows "
+                "(snapshot_id, rank, player_name, stages, matched_fid, "
+                "player_alliance_tag) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (sid, int(rank), r.get("name") or "", int(r["value"]),
+                 int(r["fid"]) if r.get("fid") else None,
+                 r.get("alliance_tag")),
+            )
+        conn.commit()
+        return sid
+
+
+def load_labyrinth_snapshot(alliance_id: int) -> Optional[dict]:
+    """Latest state leaderboard snapshot, or None."""
+    with sqlite3.connect(_ATT_DB, timeout=30.0) as conn:
+        meta = conn.execute(
+            "SELECT snapshot_id, snapshot_date, created_at FROM labyrinth_snapshots "
+            "WHERE alliance_id = ? ORDER BY snapshot_id DESC LIMIT 1",
+            (int(alliance_id),),
+        ).fetchone()
+        if not meta:
+            return None
+        sid, snap_date, created_at = meta
+        cols = [r[1] for r in conn.execute(
+            "PRAGMA table_info(labyrinth_snapshot_rows)"
+        ).fetchall()]
+        has_tag = "player_alliance_tag" in cols
+        if has_tag:
+            rows = conn.execute(
+                "SELECT rank, player_name, stages, matched_fid, player_alliance_tag "
+                "FROM labyrinth_snapshot_rows WHERE snapshot_id = ? ORDER BY rank ASC",
+                (sid,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT rank, player_name, stages, matched_fid "
+                "FROM labyrinth_snapshot_rows WHERE snapshot_id = ? ORDER BY rank ASC",
+                (sid,),
+            ).fetchall()
+    return {
+        "snapshot_date": snap_date,
+        "created_at": created_at,
+        "rows": [
+            {
+                "rank": r[0], "name": r[1], "stages": r[2], "fid": r[3],
+                "alliance_tag": r[4] if has_tag and len(r) > 4 else None,
+            }
+            for r in rows
+        ],
+    }
+
+
+_init_labyrinth_snapshot_tables()
 
 # Min similarity to reuse a stored alias key when OCR drifts between screenshots.
 _OCR_ALIAS_FUZZY_MIN = 0.92
@@ -1438,6 +1918,24 @@ class OcrUploadSession:
         self.current_image_idx: Optional[int] = None
         self.current_phase: Optional[str] = None   # 'ocr' or 'fallback'
         self.current_lang: Optional[str] = None
+        self._pending_interaction: Optional[discord.Interaction] = None
+
+    async def _edit_session_message(self, *, embed: discord.Embed,
+                                    view: Optional[discord.ui.View] = None) -> None:
+        """Edit the upload/review message; completes a deferred button interaction."""
+        pending = self._pending_interaction
+        if pending is not None and pending.response.is_done():
+            try:
+                await pending.edit_original_response(embed=embed, view=view)
+                self._pending_interaction = None
+                return
+            except (discord.NotFound, discord.HTTPException):
+                self._pending_interaction = None
+        if self.progress_message:
+            try:
+                await self.progress_message.edit(embed=embed, view=view)
+            except discord.NotFound:
+                self.progress_message = None
 
     async def start(self, attachments: list[discord.Attachment], *, status_message=None):
         if status_message is not None:
@@ -1451,23 +1949,42 @@ class OcrUploadSession:
                 view=_ProgressView(self),
             )
         await self.add_attachments(attachments)
-        self.restart_timer()
 
     async def add_attachments(self, attachments: list[discord.Attachment]):
         self.known_total_images += len(attachments)
         if self.progress_message is not None:
             await self.render_progress()
+        self.image_attachments.extend(attachments)
+        self.restart_timer()
+        asyncio.create_task(self._run_attachment_batch(attachments))
+
+    async def _run_attachment_batch(self, attachments: list[discord.Attachment]):
+        """Process OCR off the hot path so button interactions can defer promptly."""
         async with self._lock:
-            self.image_attachments.extend(attachments)
-            await self._process_attachments(attachments)
-            self.restart_timer()
-            self.current_image_idx = None
-            self.current_phase = None
-            self.current_lang = None
-            await self.render_progress()
+            try:
+                await self._process_attachments(attachments)
+            except Exception:
+                logger.exception("OcrUploadSession: attachment batch failed")
+            finally:
+                self.current_image_idx = None
+                self.current_phase = None
+                self.current_lang = None
+                if not self.finalized and not self.cancelled:
+                    await self.render_progress()
+                    self.restart_timer()
 
     async def finalize(self, *, timed_out: bool = False):
         if self.finalized or self.cancelled:
+            pending = self._pending_interaction
+            if pending is not None and pending.response.is_done():
+                try:
+                    await pending.followup.send(
+                        f"{theme.warnIcon} This upload is already being reviewed.",
+                        ephemeral=True,
+                    )
+                except (discord.NotFound, discord.HTTPException):
+                    pass
+                self._pending_interaction = None
             return
         self.finalized = True
         self.delete_snapshot()
@@ -1479,6 +1996,16 @@ class OcrUploadSession:
                 await self.render_review(timed_out=timed_out)
         except Exception:
             logger.exception("OcrUploadSession: failed to render review")
+            pending = self._pending_interaction
+            if pending is not None and pending.response.is_done():
+                try:
+                    await pending.followup.send(
+                        f"{theme.deniedIcon} Couldn't open the review screen — try again.",
+                        ephemeral=True,
+                    )
+                except (discord.NotFound, discord.HTTPException):
+                    pass
+                self._pending_interaction = None
 
     async def cancel(self, *, by_user: bool = False):
         if self.finalized or self.cancelled:
@@ -1486,18 +2013,14 @@ class OcrUploadSession:
         self.cancelled = True
         self.delete_snapshot()
         self.stop_timer()
-        if self.progress_message:
-            try:
-                await self.progress_message.edit(
-                    embed=discord.Embed(
-                        title=f"{theme.deniedIcon} Upload cancelled",
-                        description="Session cancelled by user." if by_user else "Session timed out with no images.",
-                        color=theme.emColor2,
-                    ),
-                    view=None,
-                )
-            except Exception:
-                pass
+        await self._edit_session_message(
+            embed=discord.Embed(
+                title=f"{theme.deniedIcon} Upload cancelled",
+                description="Session cancelled by user." if by_user else "Session timed out with no images.",
+                color=theme.emColor2,
+            ),
+            view=None,
+        )
 
     def restart_timer(self):
         self.stop_timer()
@@ -1551,6 +2074,7 @@ class OcrUploadSession:
                 f"**{theme.userIcon} Uploader:** <@{self.uploader_id}>\n"
                 f"{progress_line}"
                 f"{self.extra_progress_lines()}"
+                f"{self._collection_footer()}\n"
                 f"{theme.lowerDivider}\n"
             ),
             color=theme.emColor1,
@@ -1647,21 +2171,32 @@ class OcrUploadSession:
     def extra_progress_lines(self) -> str:
         return ""
 
+    def collection_timeout_minutes(self) -> int:
+        return max(1, round(self.timeout_seconds / 60))
+
+    def _collection_footer(self) -> str:
+        mins = self.collection_timeout_minutes()
+        if self.current_image_idx is not None:
+            return (
+                f"\n{theme.hourglassIcon} You can click **Done Uploading** anytime — "
+                f"it will wait for current screenshots to finish before opening the review."
+            )
+        return (
+            f"\n{theme.hourglassIcon} Waiting up to **{mins} min** for more screenshots… "
+            f"Click **Done Uploading** when finished."
+        )
+
+    async def reopen_for_more_uploads(self):
+        """Resume collecting when the uploader sends more images while review is open."""
+        self.finalized = False
+        self.restart_timer()
+        await self.render_progress()
+
     async def _process_attachments(self, attachments: list[discord.Attachment]):
         raise NotImplementedError
 
     async def render_review(self, *, timed_out: bool):
         raise NotImplementedError
-
-
-async def _safe_defer(interaction: discord.Interaction) -> None:
-    """Best-effort interaction ack: the 3s window can lapse while parsing, and
-    `finalize`/`cancel` edit the progress message directly, so a failed ack must
-    never abort the action."""
-    try:
-        await interaction.response.defer()
-    except (discord.HTTPException, discord.InteractionResponded):
-        pass
 
 
 class _ProgressView(discord.ui.View):
@@ -1683,14 +2218,26 @@ class _ProgressView(discord.ui.View):
     @discord.ui.button(label="Done Uploading", style=discord.ButtonStyle.success,
                        emoji=f"{theme.verifiedIcon}")
     async def done(self, interaction: discord.Interaction, _button: discord.ui.Button):
-        await _safe_defer(interaction)
-        await self.session.finalize(timed_out=False)
+        if interaction.response.is_done():
+            return
+        try:
+            await interaction.response.defer()
+        except (discord.NotFound, discord.HTTPException, discord.InteractionResponded):
+            return
+        self.session._pending_interaction = interaction
+        asyncio.create_task(self.session.finalize(timed_out=False))
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger,
                        emoji=f"{theme.deniedIcon}")
     async def cancel(self, interaction: discord.Interaction, _button: discord.ui.Button):
-        await _safe_defer(interaction)
-        await self.session.cancel(by_user=True)
+        if interaction.response.is_done():
+            return
+        try:
+            await interaction.response.defer()
+        except (discord.NotFound, discord.HTTPException, discord.InteractionResponded):
+            return
+        self.session._pending_interaction = interaction
+        asyncio.create_task(self.session.cancel(by_user=True))
 
     async def on_timeout(self):
         """Collapse a stuck progress message into a small expiry notice
@@ -1786,11 +2333,7 @@ class PowerRankingsSession(OcrUploadSession):
             registration_value_label=self.registration_value_label,
             result_value_label=self.result_value_label,
         )
-        if self.progress_message:
-            try:
-                await self.progress_message.edit(embed=view.build_embed(), view=view)
-            except discord.NotFound:
-                pass
+        await self._edit_session_message(embed=view.build_embed(), view=view)
 
 
 def _parse_power_rows(text: str) -> list[dict]:
@@ -1834,6 +2377,234 @@ def _parse_power_rows(text: str) -> list[dict]:
         # name+value) works; `power` is kept for the session's dedup + persistence.
         rows.append({"rank": rank, "name": name, "power": value, "value": value})
     return rows
+
+
+_LABYRINTH_MIN_STAGES = 500
+_LABYRINTH_MAX_STAGES = 50_000
+_LABYRINTH_MAX_RANK = 100
+_LABYRINTH_LIST_BOUNDARY_RE = re.compile(
+    r"Ranking\s+Chief\s+Total\s+Stages",
+    re.IGNORECASE,
+)
+# Podium OCR puts all three names first, then all three stage totals (2nd–1st–3rd).
+_LABYRINTH_PODIUM_NAME_RE = re.compile(
+    r"\[[^\]]+\][^\[]*"
+    r"|(?<![\[])\b[\w\u00C0-\u024F\u3040-\u30FF\u4E00-\u9FFF][\w\u00C0-\u024F\u3040-\u30FF\u4E00-\u9FFF\s\-·]*",
+    re.UNICODE,
+)
+_LABYRINTH_LIST_STOPWORDS = _PARSE_STOPWORDS - {"no"}  # keep "No" in names like "KOKORO No YAMI"
+
+
+def _labyrinth_name_tokens(chunk: str) -> list[str]:
+    tokens = []
+    for t in chunk.split():
+        if t.lower() not in _LABYRINTH_LIST_STOPWORDS and any(c.isalpha() for c in t) and len(t) >= 2:
+            tokens.append(t)
+    return tokens
+
+
+def _labyrinth_rank_from_chunk(chunk: str, name: str) -> Optional[int]:
+    """Rank is the last standalone 1–3 digit number immediately before the name."""
+    if not name:
+        return None
+    idx = chunk.rfind(name)
+    if idx < 0:
+        tail = name.split()[-1] if name.split() else name
+        idx = chunk.rfind(tail)
+    prefix = chunk[:idx] if idx >= 0 else chunk
+    rank = None
+    for m in re.finditer(r"(?<![A-Za-z0-9])(\d{1,3})(?![A-Za-z0-9,\.])", prefix):
+        v = int(m.group(1))
+        if 1 <= v <= _LABYRINTH_MAX_RANK:
+            rank = v
+    return rank
+
+
+def _extract_labyrinth_podium_names(pre: str) -> list[str]:
+    """Names from the podium strip before the three trailing stage totals."""
+    pre = re.sub(r"The\s+Labyrinth", " ", pre, flags=re.IGNORECASE)
+    pre = re.sub(r"\bx\s*\d+\b", " ", pre, flags=re.IGNORECASE)
+    names: list[str] = []
+    for m in _LABYRINTH_PODIUM_NAME_RE.finditer(pre):
+        name = m.group(0).strip()
+        if len(name) < 2 or not any(c.isalpha() for c in name):
+            continue
+        if name.lower() in _LABYRINTH_LIST_STOPWORDS:
+            continue
+        names.append(_strip_leading_alliance_tag(name))
+    return names[-3:] if len(names) >= 3 else names
+
+
+def _parse_labyrinth_podium(text: str) -> list[dict]:
+    """Podium: three names then three Total Stages values before the list header."""
+    m = _LABYRINTH_LIST_BOUNDARY_RE.search(text)
+    if not m:
+        return []
+    head = text[:m.start()]
+    nums = find_formatted_numbers(head)
+    if len(nums) < 3:
+        return []
+    last_three = nums[-3:]
+    values = [v for _, _, v in last_three]
+    if not all(_LABYRINTH_MIN_STAGES <= v <= _LABYRINTH_MAX_STAGES for v in values):
+        return []
+    names = _extract_labyrinth_podium_names(head[:last_three[0][0]])
+    if len(names) != 3:
+        return []
+    paired = sorted(zip(names, values), key=lambda nv: -nv[1])
+    out = []
+    for rank, (raw_name, stages) in enumerate(paired, start=1):
+        name, alliance_tag = _parse_alliance_tag_and_name(raw_name)
+        row = {"rank": rank, "name": name, "stages": stages, "value": stages}
+        if alliance_tag:
+            row["alliance_tag"] = alliance_tag
+        out.append(row)
+    return out
+
+
+def _parse_labyrinth_list_rows(text: str) -> list[dict]:
+    """List rows (ranks 4–100): rank, [alliance] name, Total Stages."""
+    rows = []
+    m = _LABYRINTH_LIST_BOUNDARY_RE.search(text)
+    list_text = text[m.end():] if m else _trim_to_data_section(text)
+    prev_end = 0
+    for start, end, value in find_formatted_numbers(list_text):
+        if value < _LABYRINTH_MIN_STAGES or value > _LABYRINTH_MAX_STAGES:
+            continue
+        chunk = list_text[prev_end:start].strip()
+        prev_end = end
+        chunk = re.sub(r"\bR\d+\b", "", chunk)
+        tokens = _labyrinth_name_tokens(chunk)
+        if not tokens:
+            continue
+        raw_name = _name_from_tokens(tokens)
+        name, alliance_tag = _parse_alliance_tag_and_name(raw_name)
+        if len(name) < 2:
+            continue
+        rank = _labyrinth_rank_from_chunk(chunk, name)
+        row = {"rank": rank, "name": name, "stages": value, "value": value}
+        if alliance_tag:
+            row["alliance_tag"] = alliance_tag
+        rows.append(row)
+    return rows
+
+
+def _assign_labyrinth_podium_ranks(rows: list[dict]) -> None:
+    """Legacy helper for flat name+value podium OCR; real screens use grouped layout."""
+    split_at = len(rows)
+    for i, row in enumerate(rows):
+        rank = row.get("rank")
+        if rank is not None and rank >= 4:
+            split_at = i
+            break
+    podium = [r for r in rows[:split_at] if r.get("rank") is None]
+    if len(podium) != 3:
+        return
+    for rank, row in enumerate(sorted(podium, key=lambda r: -r["stages"]), start=1):
+        row["rank"] = rank
+
+
+def _parse_labyrinth_rows(text: str) -> list[dict]:
+    """Parse Labyrinth leaderboard: podium (ranks 1–3) + list (ranks 4–100)."""
+    rows = _parse_labyrinth_podium(text)
+    rows.extend(_parse_labyrinth_list_rows(text))
+    return rows
+
+
+# ── Labyrinth Leaderboard session ─────────────────────────────────────────
+
+class LabyrinthLeaderboardSession(OcrUploadSession):
+    """Labyrinth state leaderboard: stitch scroll screenshots, read Total Stages
+    (podium ranks 1–3 by stage count; list ranks 4–100 from the rank column),
+    match to the alliance roster, and write a one-time snapshot to users."""
+
+    db_event_type = "labyrinth_leaderboard"
+    registration_value_label = "Power"        # unused — no sign-up phase
+    result_value_label = "Total Stages"
+    simple_results = True
+    stages_only_snapshot = True               # Submit updates users.labyrinth_stages
+
+    def __init__(self, *, alliance_id: int, **kwargs):
+        super().__init__(**kwargs)
+        self.alliance_id = alliance_id
+        self.rows: list[dict] = []
+        self.result_rows: list[dict] = []
+        self.registered_rows: list[dict] = []
+        self.detected_date = datetime.now(timezone.utc).date()
+        self.detected_legion = None
+        self.detected_time = None
+        self.date_confidence = None
+        self.alliance_rank: Optional[int] = None
+        self.alliance_scores: list = []
+        self.stats: dict = {}
+        self.mvps: list = []
+
+    async def _process_attachments(self, attachments: list[discord.Attachment]):
+        roster = load_alliance_roster(self.alliance_id)
+        for att in attachments:
+            self.current_image_idx = self.processed_images + 1
+            await self.render_progress()
+            try:
+                data = await att.read()
+                rows, _text = await ocr_value_rows(
+                    data, roster=roster, alliance_id=self.alliance_id,
+                    parse=_parse_labyrinth_rows, progress_callback=self._phase_callback)
+            except Exception:
+                self.processed_images += 1
+                continue
+            await asyncio.to_thread(self._ingest_labyrinth_rows, rows)
+            self.processed_images += 1
+            await self.render_progress()
+            self.save_snapshot()
+        await self._refresh_labyrinth_results_async()
+
+    def _ingest_labyrinth_rows(self, rows: list[dict]) -> None:
+        for row in rows:
+            _dedup_labyrinth_into(self.rows, row)
+
+    async def _refresh_labyrinth_results_async(self) -> None:
+        self.rows = await asyncio.to_thread(
+            _reconcile_labyrinth_rows, self.rows, alliance_id=self.alliance_id,
+        )
+        self.result_rows = [
+            {
+                "name": r["name"], "value": r["stages"], "rank": r.get("rank"),
+                "alliance_tag": r.get("alliance_tag"),
+            }
+            for r in sorted(
+                self.rows,
+                key=lambda r: (r.get("rank") is None, r.get("rank") or 9999, -r["stages"]),
+            )
+        ]
+
+    def _refresh_labyrinth_results(self) -> None:
+        self.rows = _reconcile_labyrinth_rows(self.rows, alliance_id=self.alliance_id)
+        self.result_rows = [
+            {
+                "name": r["name"], "value": r["stages"], "rank": r.get("rank"),
+                "alliance_tag": r.get("alliance_tag"),
+            }
+            for r in sorted(
+                self.rows,
+                key=lambda r: (r.get("rank") is None, r.get("rank") or 9999, -r["stages"]),
+            )
+        ]
+
+    def extra_progress_lines(self) -> str:
+        return (
+            f"**{theme.listIcon} State ranks parsed:** `{len(self.rows)}` / 100 "
+            f"(scroll and upload more screenshots to fill gaps)\n"
+        )
+
+    async def render_review(self, *, timed_out: bool):
+        await self._refresh_labyrinth_results_async()
+        from .attendance_ocr_review import EventReviewView
+        view = EventReviewView(
+            self,
+            registration_value_label=self.registration_value_label,
+            result_value_label=self.result_value_label,
+        )
+        await self._edit_session_message(embed=view.build_embed(), view=view)
 
 
 # ── Foundry / Canyon unified session: registration + result in one ────────
@@ -1890,14 +2661,14 @@ class _PointsSession(OcrUploadSession):
                 if d:
                     self.detected_date, self.date_confidence = resolve_event_date(
                         d, self.db_event_type, registration=(kind == "registration"))
-            if self.detected_legion is None:
-                self.detected_legion = extract_legion(text)
 
             target = self.result_rows if kind == "result" else self.registered_rows
             header_page = False
             if kind == "result":
                 self._merge_result_metadata(text, blocks=blocks)
                 header_page = _is_result_header_page(text)
+
+            self._update_detected_legion(text)
             # Header pages would yield bogus rows from alliance-level totals.
             if not header_page:
                 # Multi-language fallback so non-Latin names (e.g. Arabic) read
@@ -1918,6 +2689,15 @@ class _PointsSession(OcrUploadSession):
             self.processed_images += 1
             await self.render_progress()
             self.save_snapshot()
+
+    def _update_detected_legion(self, text: str):
+        if self.detected_legion is not None:
+            return
+        legion = extract_legion(text)
+        if legion is None:
+            legion = infer_legion_from_scoreboard(
+                self.alliance_scores, self.alliance_rank)
+        self.detected_legion = legion
 
     def _merge_result_metadata(self, text: str, blocks: Optional[list] = None):
         """Capture alliance rank / scoreboard / stats / MVPs from a result-mail header."""
@@ -1955,6 +2735,11 @@ class _PointsSession(OcrUploadSession):
         bits = []
         if self.detected_legion:
             bits.append(f"**{theme.shieldIcon} Legion:** `{self.detected_legion}`")
+        elif (cfg := EVENT_TYPES.get(self.db_event_type)) and cfg.legion_required:
+            bits.append(
+                f"**{theme.warnIcon} Legion:** not detected — include the result "
+                f"header screenshot or set legion in **Edit Event Info** before submit"
+            )
         if self.detected_date:
             bits.append(f"**{theme.calendarIcon} Event date:** `{self.detected_date.isoformat()}`")
         if self.alliance_rank is not None:
@@ -2001,11 +2786,7 @@ class _PointsSession(OcrUploadSession):
             existing_session_id=existing_closed_id,
             enriching_open_session_id=existing_open_id,
         )
-        if self.progress_message:
-            try:
-                await self.progress_message.edit(embed=view.build_embed(), view=view)
-            except discord.NotFound:
-                pass
+        await self._edit_session_message(embed=view.build_embed(), view=view)
 
     def _merge_existing(self, existing: dict):
         """Overlay newly-OCR'd data on top of an existing CLOSED session's data; new wins."""
@@ -2156,17 +2937,14 @@ class AllianceShowdownSession(OcrUploadSession):
             registration_value_label=self.registration_value_label,
             result_value_label=self.result_value_label,
         )
-        if self.progress_message:
-            try:
-                await self.progress_message.edit(embed=view.build_embed(), view=view)
-            except discord.NotFound:
-                pass
+        await self._edit_session_message(embed=view.build_embed(), view=view)
 
 
 # ── factory ───────────────────────────────────────────────────────────────
 
 SESSION_CLASSES: dict[str, type[OcrUploadSession]] = {
     "power_rankings": PowerRankingsSession,
+    "labyrinth_leaderboard": LabyrinthLeaderboardSession,
     "foundry_battle": FoundryBattleSession,
     "canyon_clash": CanyonClashSession,
     "alliance_showdown": AllianceShowdownSession,
@@ -2174,12 +2952,15 @@ SESSION_CLASSES: dict[str, type[OcrUploadSession]] = {
 
 
 def build_session(event_type: str, *, cog, channel, uploader, alliance_id: int) -> Optional[OcrUploadSession]:
+    from .attendance_ocr_setup import get_ocr_session_timeout_min
     cls = SESSION_CLASSES.get(event_type)
     if cls is None:
         return None
+    timeout_seconds = get_ocr_session_timeout_min(alliance_id) * 60
     return cls(
         cog=cog, channel=channel, uploader_id=uploader.id,
         event_type=event_type, alliance_id=alliance_id,
+        timeout_seconds=timeout_seconds,
     )
 
 

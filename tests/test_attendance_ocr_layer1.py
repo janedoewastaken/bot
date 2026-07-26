@@ -27,6 +27,8 @@ from harness_attendance import parsers, load_roster
     ("canyon_clash", "Personal Point Ranking", True),
     ("canyon_clash", "selected as a combatant for Canyon Clash event", True),
     ("power_rankings", "Alliance Ranking Power Rankings", True),
+    ("labyrinth_leaderboard", "The Labyrinth Total Stages Ranking Chief", True),
+    ("labyrinth_leaderboard", "Power Rankings", False),
     ("alliance_showdown", "Alliance Showdown Point Ranking", True),
     # Wrong fingerprint for event type
     ("foundry_battle", "Personal Point Ranking (canyon)", False),
@@ -93,11 +95,12 @@ _TEXT_CANYON_RESULT = (
     "Personal Point Ranking attached."
 )
 _TEXT_POWER_RANKING = "Alliance Ranking · Power Rankings tab"
+_TEXT_LABYRINTH = "The Labyrinth Ranking Chief Total Stages"
 _TEXT_SHOWDOWN = "Alliance Showdown Final Standings Point Ranking"
 # After the unified-registration refactor, only the four "real" event types
 # exist; per-screenshot kind ("registration" / "result") is returned as the
 # tuple's second element by classify_event.
-_ALL_EVENTS = ["foundry_battle", "canyon_clash", "power_rankings", "alliance_showdown"]
+_ALL_EVENTS = ["foundry_battle", "canyon_clash", "power_rankings", "labyrinth_leaderboard", "alliance_showdown"]
 
 
 def test_classify_event_no_keywords_fingerprint_alone_works():
@@ -106,6 +109,7 @@ def test_classify_event_no_keywords_fingerprint_alone_works():
     assert parsers.classify_event(_TEXT_CANYON_REG, _ALL_EVENTS) == ("canyon_clash", "registration")
     assert parsers.classify_event(_TEXT_CANYON_RESULT, _ALL_EVENTS) == ("canyon_clash", "result")
     assert parsers.classify_event(_TEXT_POWER_RANKING, _ALL_EVENTS) == ("power_rankings", "result")
+    assert parsers.classify_event(_TEXT_LABYRINTH, _ALL_EVENTS) == ("labyrinth_leaderboard", "result")
     assert parsers.classify_event(_TEXT_SHOWDOWN, _ALL_EVENTS) == ("alliance_showdown", "result")
 
 
@@ -278,6 +282,38 @@ def test_resolve_event_date_event_without_weekday_returns_exact():
 ])
 def test_extract_legion(text, expected):
     assert parsers.extract_legion(text) == expected
+
+
+def test_extract_legion_foundry_victory_banner_beats_scoreboard():
+    """Foundry win banner names your legion even when the scoreboard lists
+    another alliance's legion first in the OCR stream."""
+    text = (
+        "Legion 1 [CAT]bluCATs 478,798 "
+        "Legion 2 Victory! Imperial Foundry Control Duration 00:43:41"
+    )
+    assert parsers.extract_legion(text) == "Legion 2"
+
+
+def test_extract_legion_canyon_ranked_line():
+    text = "Legion 2 ranked No. 2 in [Canyon Clash]. Total Fuel Used 31.1M"
+    assert parsers.extract_legion(text) == "Legion 2"
+
+
+def test_infer_legion_from_scoreboard_on_defeat():
+    """Defeat mails omit your legion — infer from placement + scoreboard."""
+    text = (
+        "Unfortunately your alliance was defeated in the [Foundry Battle]. "
+        "Here are the battle details: #312 #449 "
+        "Legion 1 Legion 2 "
+        "[CAT]bluCATs [BRF]BestRoyalFamily "
+        "478,798 308,419 "
+        "Imperial Foundry Control"
+    )
+    assert parsers.extract_legion(text) == "Legion 1"  # wrong without inference
+    sb = parsers._parse_alliance_scoreboard(text)
+    rank = parsers._foundry_rank_from_outcome(text)
+    assert rank == 2
+    assert parsers.infer_legion_from_scoreboard(sb, rank) == "Legion 2"
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +494,180 @@ def test_parse_power_rows_allows_optional_rank():
     assert len(rows) == 1
     assert rows[0]["rank"] is None
     assert rows[0]["power"] == 925_096_779
+
+
+# ---------------------------------------------------------------------------
+# Labyrinth leaderboard row parser (rank prefix + name + total stages)
+# ---------------------------------------------------------------------------
+
+def test_strip_leading_alliance_tag():
+    assert parsers._strip_leading_alliance_tag("[BUL]Cocoa") == "Cocoa"
+    assert parsers._strip_leading_alliance_tag("<BOS>Fred62") == "Fred62"
+    assert parsers._normalize_for_match("[BUL]Cocoa") == parsers._normalize_for_match("Cocoa")
+
+
+def test_parse_alliance_tag_and_name():
+    assert parsers._parse_alliance_tag_and_name("6L [BUL]Filthy Scholar") == (
+        "Filthy Scholar", "BUL",
+    )
+    assert parsers._parse_alliance_tag_and_name("LL [NAH]Highbury") == (
+        "Highbury", "NAH",
+    )
+    assert parsers._parse_alliance_tag_and_name("[BUL]Jane") == ("Jane", "BUL")
+
+
+def test_apply_labyrinth_history_fixes_misread_rank():
+    history = [
+        {"rank": 29, "name": "Jane", "stages": 1545, "alliance_tag": "BUL"},
+        {"rank": 87, "name": "Dark Fred", "stages": 1312},
+    ]
+    rows = [
+        {"rank": 89, "name": "Jane", "stages": 1616, "value": 1616},
+        {"rank": 87, "name": "Dark Fred", "stages": 1310, "value": 1310},
+    ]
+    out = parsers._apply_labyrinth_history(rows, history)
+    by_name = {r["name"]: r for r in out}
+    assert by_name["Jane"]["rank"] == 29
+    assert by_name["Dark Fred"]["rank"] == 87
+
+
+def test_apply_labyrinth_history_ignores_large_stage_drop():
+    history = [{"rank": 29, "name": "Jane", "stages": 1545}]
+    rows = [{"rank": 89, "name": "Jane", "stages": 900, "value": 900}]
+    out = parsers._apply_labyrinth_history(rows, history)
+    assert out[0]["rank"] == 89
+
+
+def test_parse_labyrinth_rows_alliance_tag():
+    text = "Ranking Chief Total Stages 88 6L [BUL]Filthy Scholar 1,616"
+    rows = parsers._parse_labyrinth_rows(text)
+    assert len(rows) == 1
+    assert rows[0]["name"] == "Filthy Scholar"
+    assert rows[0]["alliance_tag"] == "BUL"
+    assert rows[0]["rank"] == 88
+
+
+def test_parse_labyrinth_rows_strips_tags():
+    text = (
+        "The Labyrinth x 3 Roff [BUL]MONI [BUL]Santisomo 1,869 1,909 1,838 "
+        "Ranking Chief Total Stages 4 [BUL]Cocoa 1,810"
+    )
+    rows = parsers._parse_labyrinth_rows(text)
+    by_rank = {r["rank"]: r for r in rows}
+    assert by_rank[1]["name"] == "MONI"
+    assert by_rank[4]["name"] == "Cocoa"
+
+
+def test_parse_labyrinth_rows_basic():
+    text = (
+        "The Labyrinth Ranking Chief Total Stages "
+        "4 [BUL]Cocoa 1,803 "
+        "5 [ExC]Spankit 1,802 "
+        "6 [BUL]Dead End 1,801 "
+        "29 [BUL]Jane 1,545"
+    )
+    rows = parsers._parse_labyrinth_rows(text)
+    assert len(rows) == 4
+    by_name = {r["name"]: r for r in rows}
+    assert by_name["Cocoa"]["stages"] == 1803
+    assert by_name["Cocoa"]["rank"] == 4
+    assert by_name["Jane"]["stages"] == 1545
+    assert by_name["Jane"]["rank"] == 29
+
+
+def test_parse_labyrinth_rows_podium_without_rank():
+    """Real OCR: three names, then three stage totals (2nd–1st–3rd left-to-right)."""
+    text = (
+        "The Labyrinth x 3 Roff [BUL]MONI [BUL]Santisomo 1,869 1,909 1,838 "
+        "Ranking Chief Total Stages"
+    )
+    rows = parsers._parse_labyrinth_rows(text)
+    assert len(rows) == 3
+    by_name = {r["name"]: r for r in rows}
+    assert by_name["MONI"]["rank"] == 1
+    assert by_name["MONI"]["stages"] == 1909
+    assert by_name["Roff"]["rank"] == 2
+    assert by_name["[BUL]Santisomo"]["rank"] == 3
+
+
+def test_parse_labyrinth_rows_real_ocr_page1():
+    text = (
+        "The Labyrinth x 3 Roff [BUL]MÖNI [BUL]Santisomo 1,869 1,909 1,838 "
+        "Ranking Chief Total Stages 4 [BUL]Cocoa 1,810 5 [ExC]Spankit 1,791 "
+        "29 [BUL]Jane 1,545"
+    )
+    rows = parsers._parse_labyrinth_rows(text)
+    assert len(rows) == 5
+    ranks = {r["rank"] for r in rows}
+    assert ranks >= {1, 2, 3, 4, 29}
+
+
+def test_parse_labyrinth_rows_podium_requires_three():
+    text = (
+        "The Labyrinth [BUL]MONI 1,909 Roff 1,869 "
+        "Ranking Chief Total Stages"
+    )
+    rows = parsers._parse_labyrinth_rows(text)
+    assert len(rows) == 0
+
+
+def test_parse_labyrinth_rows_drops_rank_and_sub_stage_values():
+    """Rank digits and tiny numbers must not be parsed as stage totals."""
+    text = "Ranking Chief Total Stages 4 99 some_player 999"
+    rows = parsers._parse_labyrinth_rows(text)
+    assert rows == []
+
+
+def test_parse_labyrinth_rows_list_ranks_up_to_100():
+    text = "Total Stages 4 [BUL]Cocoa 1,803 100 [BUL]Tail 1,500"
+    rows = parsers._parse_labyrinth_rows(text)
+    assert len(rows) == 2
+    assert rows[0]["rank"] == 4
+    assert rows[1]["rank"] == 100
+
+
+def test_parse_labyrinth_rows_value_mirrors_stages():
+    text = "Total Stages 10 [BUL]Tickles 1,685"
+    rows = parsers._parse_labyrinth_rows(text)
+    assert rows and rows[0]["value"] == rows[0]["stages"] == 1685
+
+
+def test_dedup_labyrinth_merges_same_player_wrong_rank():
+    """OCR often reads 29 as 89 — same name + stages must collapse to one row."""
+    target = [{"rank": 29, "name": "Jane", "stages": 1545, "value": 1545}]
+    parsers._dedup_labyrinth_into(
+        target, {"rank": 89, "name": "Jane", "stages": 1545, "value": 1545},
+    )
+    assert len(target) == 1
+    assert target[0]["rank"] == 29
+    assert target[0]["stages"] == 1545
+
+
+def test_reconcile_labyrinth_fixes_duplicate_rank_blocks():
+    """Two scroll pages both OCR'd as ranks 87–89; stages reveal true ordering."""
+    rows = [
+        {"rank": 87, "name": "Dark Fred", "stages": 1312, "value": 1312},
+        {"rank": 88, "name": "K4tm4ndu", "stages": 1309, "value": 1309},
+        {"rank": 89, "name": "Anka", "stages": 1294, "value": 1294},
+        {"rank": 87, "name": "Highbury", "stages": 1677, "value": 1677},
+        {"rank": 88, "name": "Filthy Scholar", "stages": 1616, "value": 1616},
+        {"rank": 89, "name": "Jane", "stages": 1545, "value": 1545},
+    ]
+    out = parsers._reconcile_labyrinth_rows(rows)
+    by_name = {r["name"]: r for r in out}
+    assert len(out) == 6
+    assert by_name["Jane"]["stages"] == 1545
+    assert by_name["Jane"]["rank"] != 89
+    ranks = [r["rank"] for r in out]
+    assert len(ranks) == len(set(ranks)), f"duplicate ranks after reconcile: {ranks}"
+    assert by_name["Dark Fred"]["rank"] == 87
+    assert by_name["K4tm4ndu"]["rank"] == 88
+
+
+def test_labyrinth_rank_from_chunk_uses_last_rank_before_name():
+    chunk = "87 Dark Fred 88 K4tm4ndu"
+    assert parsers._labyrinth_rank_from_chunk(chunk, "K4tm4ndu") == 88
+    assert parsers._labyrinth_rank_from_chunk("29 [BUL]Jane", "Jane") == 29
 
 
 # ---------------------------------------------------------------------------

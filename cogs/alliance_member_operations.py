@@ -1015,6 +1015,43 @@ class AllianceMemberOperations(commands.Cog):
         except discord.HTTPException:
             pass
 
+    async def show_labyrinth_leaderboard_for(self, interaction: discord.Interaction, alliance_id: int):
+        """Show the latest full state Labyrinth leaderboard snapshot."""
+        from .attendance_ocr_parsers import load_labyrinth_snapshot
+
+        with sqlite3.connect('db/alliance.sqlite') as alliance_db:
+            row = alliance_db.execute(
+                "SELECT name FROM alliance_list WHERE alliance_id = ?", (alliance_id,)
+            ).fetchone()
+        if not row:
+            await interaction.response.send_message(
+                f"{theme.deniedIcon} Alliance not found.", ephemeral=True
+            )
+            return
+        alliance_name = row[0]
+
+        snap = load_labyrinth_snapshot(alliance_id)
+        if not snap or not snap.get("rows"):
+            await interaction.response.send_message(
+                f"{theme.warnIcon} No Labyrinth snapshot yet — upload state leaderboard "
+                f"screenshots via **Attendance → Screenshot Upload**, then submit.",
+                ephemeral=True,
+            )
+            return
+
+        view = AllianceLabyrinthRankingsView(
+            snap["rows"], alliance_id, alliance_name, self, interaction.user.id,
+            snapshot_date=snap.get("snapshot_date"),
+            created_at=snap.get("created_at"),
+        )
+        await safe_edit_message(
+            interaction, embed=view.build_embed(), view=view, content=None,
+        )
+        try:
+            view.message = await interaction.original_response()
+        except discord.HTTPException:
+            pass
+
     async def show_manage_members_for(self, interaction: discord.Interaction, alliance_id: int):
         """Open the unified Manage Members view (filter, sort, multi-select, act)."""
         with sqlite3.connect('db/alliance.sqlite') as alliance_db:
@@ -3452,6 +3489,153 @@ class AlliancePowerRankingsView(discord.ui.View):
             description="\n".join(lines),
             color=theme.emColor1,
         )
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                f"{theme.deniedIcon} Only the user who opened this menu can use it.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def _prev(self, interaction: discord.Interaction):
+        if self.current_page > 0:
+            self.current_page -= 1
+        self._build_components()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _next(self, interaction: discord.Interaction):
+        if self.current_page < self._total_pages() - 1:
+            self.current_page += 1
+        self._build_components()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _back(self, interaction: discord.Interaction):
+        main_menu = self.cog.bot.get_cog("MainMenu")
+        if main_menu and hasattr(main_menu, "show_alliance_hub"):
+            await main_menu.show_alliance_hub(interaction, self.alliance_id)
+        else:
+            await interaction.response.send_message(
+                f"{theme.deniedIcon} The alliance menu is unavailable right now.",
+                ephemeral=True,
+            )
+
+
+class AllianceLabyrinthRankingsView(discord.ui.View):
+    """Paginated state Labyrinth leaderboard from the latest OCR snapshot."""
+
+    PAGE_SIZE = 20
+
+    def __init__(self, rows, alliance_id: int, alliance_name: str,
+                 cog, user_id: int, *, snapshot_date=None, created_at=None):
+        super().__init__(timeout=7200)
+        self.rows = sorted(rows, key=lambda r: r.get("rank") or 9999)
+        self.alliance_id = alliance_id
+        self.alliance_name = alliance_name
+        self.cog = cog
+        self.user_id = user_id
+        self.snapshot_date = snapshot_date
+        self.created_at = created_at
+        self.current_page = 0
+        self.message = None
+        self._build_components()
+
+    async def on_timeout(self):
+        await disable_expired_view(self)
+
+    def _total_pages(self) -> int:
+        if not self.rows:
+            return 1
+        return (len(self.rows) + self.PAGE_SIZE - 1) // self.PAGE_SIZE
+
+    def _build_components(self):
+        self.clear_items()
+        total = self._total_pages()
+
+        prev_btn = discord.ui.Button(
+            label="Prev", emoji=theme.prevIcon,
+            style=discord.ButtonStyle.secondary,
+            disabled=self.current_page == 0, row=0,
+        )
+        prev_btn.callback = self._prev
+        self.add_item(prev_btn)
+
+        page_btn = discord.ui.Button(
+            label=f"{self.current_page + 1} / {total}",
+            style=discord.ButtonStyle.secondary,
+            disabled=True, row=0,
+        )
+        self.add_item(page_btn)
+
+        next_btn = discord.ui.Button(
+            label="Next", emoji=theme.nextIcon,
+            style=discord.ButtonStyle.secondary,
+            disabled=self.current_page >= total - 1, row=0,
+        )
+        next_btn.callback = self._next
+        self.add_item(next_btn)
+
+        back_btn = discord.ui.Button(
+            label="Back", emoji=theme.backIcon,
+            style=discord.ButtonStyle.secondary, row=1,
+        )
+        back_btn.callback = self._back
+        self.add_item(back_btn)
+
+    @staticmethod
+    def _format_stages(stages) -> str:
+        if stages is None:
+            return "—"
+        try:
+            return f"{int(stages):,}"
+        except (TypeError, ValueError):
+            return "—"
+
+    @staticmethod
+    def _relative(ts_iso) -> str:
+        if not ts_iso:
+            return ""
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
+            return f" · <t:{int(dt.timestamp())}:R>"
+        except (TypeError, ValueError):
+            return ""
+
+    def build_embed(self) -> discord.Embed:
+        start = self.current_page * self.PAGE_SIZE
+        end = start + self.PAGE_SIZE
+        page = self.rows[start:end]
+
+        snap_bits = [f"`{len(self.rows)}` / 100 state ranks"]
+        if self.snapshot_date:
+            snap_bits.append(f"snapshot `{self.snapshot_date}`")
+        if self.created_at:
+            snap_bits.append(self._relative(self.created_at).strip(" ·"))
+
+        lines = [
+            f"**State leaderboard** — {' · '.join(snap_bits)}",
+            f"{theme.verifiedIcon} = matched to your alliance roster",
+            f"{theme.upperDivider}",
+        ]
+        if not page:
+            lines.append(f"{theme.warnIcon} Snapshot is empty.")
+        else:
+            for r in page:
+                rank = r.get("rank") or "?"
+                tag = r.get("alliance_tag")
+                tag_str = f"[{tag}] " if tag else ""
+                name = _isolate_rtl(f"{tag_str}{r.get('name') or '?'}")
+                stages = self._format_stages(r.get("stages"))
+                fid = r.get("fid")
+                roster = f" {theme.verifiedIcon} `{fid}`" if fid else ""
+                lines.append(_ltr_line(
+                    f"`{str(rank):>3}` **{name}** — {stages}{roster}"
+                ))
+        lines.append(f"{theme.lowerDivider}")
+        title = f"{theme.allianceIcon} {self.alliance_name} — Labyrinth Leaderboard"
+        return discord.Embed(title=title, description="\n".join(lines), color=theme.emColor1)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.user_id:
