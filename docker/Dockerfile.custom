@@ -19,7 +19,6 @@ RUN pip install --upgrade pip && \
 
 COPY main.py ./
 COPY cogs/ cogs/
-COPY models/ models/
 
 # Tag custom installs so the updater can tell them apart from release builds.
 RUN test -f version || echo "custom-local" > version
