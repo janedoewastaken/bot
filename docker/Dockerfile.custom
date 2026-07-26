@@ -1,0 +1,33 @@
+# Custom image: builds from the local repo (includes fork-only features such as
+# Labyrinth leaderboard OCR). Does NOT download the bot from GitHub at build time.
+FROM python:3.12.12-slim-bookworm
+LABEL org.opencontainers.image.source=https://github.com/whiteout-project/bot
+LABEL org.opencontainers.image.description="WOSLand Discord bot (custom local build)"
+
+RUN apt-get update && apt-get install --no-install-recommends -y \
+    ca-certificates \
+    libgomp1 \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir opencv-python-headless
+
+COPY main.py ./
+COPY cogs/ cogs/
+COPY models/ models/
+
+# Tag custom installs so the updater can tell them apart from release builds.
+RUN test -f version || echo "custom-local" > version
+
+COPY docker/bootstrap.sh /bootstrap.sh
+RUN chmod +x /bootstrap.sh
+
+ENV PYTHONUNBUFFERED=1
+ENV MALLOC_ARENA_MAX=2
+
+ENTRYPOINT ["/bin/sh", "/bootstrap.sh"]

@@ -10,3 +10,5 @@ backups
 captcha_images
 .vscode
 CLAUDE.md
+docker/.env
+docker/data

@@ -1,0 +1,16 @@
+# Official image from GitHub Container Registry (auto-updates on restart).
+# Use this if you do NOT need custom/fork features.
+#
+#   docker compose -f docker-compose.official.yml up -d
+#
+services:
+  wos-discord-bot:
+    image: ghcr.io/whiteout-project/bot:latest
+    container_name: wos-discord-bot
+    volumes:
+      - ${WOS_DB_PATH:-./data/db}:/app/db
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - UPDATE=${UPDATE:-1}

@@ -1,9 +1,28 @@
+# Custom build from the repo next to this folder (includes local features).
+#
+# Setup:
+#   cp .env.example .env    # add your Discord bot token
+#   docker compose build
+#   docker compose up -d
+#
+# Rebuild after code changes:
+#   docker compose build && docker compose up -d
+#
+# Official upstream image instead:
+#   docker compose -f docker-compose.official.yml up -d
+#
 services:
   wos-discord-bot:
-    image: ghcr.io/whiteout-project/bot:latest
+    image: wos-discord-bot:custom
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.custom
     container_name: wos-discord-bot
     volumes:
-      - /opt/docker/wos/db/:/app/db
+      - ${WOS_DB_PATH:-./data/db}:/app/db
     restart: unless-stopped
+    env_file:
+      - .env
     environment:
-      - DISCORD_BOT_TOKEN=<your bot token here>
+      # Keep local code; do not overwrite with upstream releases on restart.
+      - UPDATE=0
