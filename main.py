@@ -14,9 +14,9 @@ if sys.platform.startswith("linux") and "MALLOC_ARENA_MAX" not in os.environ:
     os.environ.setdefault("MALLOC_TRIM_THRESHOLD_", "131072")
     try:
         from cogs import bot_startup_display as _startup
-        _startup.phase_ok("Low-memory mode enabled")
+        _startup.phase_ok("Optimized memory allocation")
     except Exception:
-        print("  Low-memory mode enabled", flush=True)
+        print("  Optimized memory allocation", flush=True)
     os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
@@ -653,6 +653,7 @@ if __name__ == "__main__":
         with open("version", "r") as f:
             _version = f.read().strip()
     _flags = []
+    if '--autoupdate' in sys.argv: _flags.append('--autoupdate')
     if '--no-update' in sys.argv: _flags.append('--no-update')
     if '--no-venv' in sys.argv: _flags.append('--no-venv')
     if '--no-dm' in sys.argv: _flags.append('--no-dm')
@@ -738,6 +739,13 @@ if __name__ == "__main__":
                 if not is_container():
                     if "--autoupdate" in sys.argv or repair_mode:
                         update = True
+                    elif not sys.stdin or not sys.stdin.isatty():
+                        # Headless host: input() would raise EOFError and crash-loop startup while an update is pending.
+                        startup.phase_fail(
+                            "Update skipped",
+                            details=["Non-interactive terminal - run with --autoupdate to install updates automatically"],
+                        )
+                        return
                     else:
                         print("  Note: If your terminal is not interactive, you can use the --autoupdate argument to skip this prompt.")
                         ask = input("  Do you want to update? (y/n): ").strip().lower()
@@ -771,8 +779,13 @@ if __name__ == "__main__":
 
                     startup.phase_start(f"Downloading update from {source_name}")
                     safe_remove("package.zip")
-                    download_resp = requests.get(download_url, timeout=600)
-                    
+                    try:
+                        download_resp = requests.get(download_url, timeout=600)
+                    except Exception as e:
+                        # A network blip must skip this update attempt, not kill startup.
+                        startup.phase_fail("Update failed", details=[f"Download error: {e}"])
+                        return
+
                     if download_resp.status_code == 200:
                         with open("package.zip", "wb") as f:
                             f.write(download_resp.content)
@@ -1020,7 +1033,6 @@ if __name__ == "__main__":
 
     class CustomBot(commands.Bot):
         no_dm: bool = False
-        save_captcha: int = 0
 
         async def on_error(self, event_name, *args, **kwargs):
             if event_name == "on_interaction":
@@ -1040,20 +1052,6 @@ if __name__ == "__main__":
 
     bot = CustomBot(command_prefix="/", intents=intents)
     bot.no_dm = '--no-dm' in sys.argv
-
-    # Captcha image saving (dev/debug only)
-    # --save-captcha=1 (failed only), =2 (success only), =3 (all)
-    bot.save_captcha = 0
-    for arg in sys.argv:
-        if arg.startswith('--save-captcha='):
-            try:
-                bot.save_captcha = int(arg.split('=', 1)[1])
-                if bot.save_captcha not in (0, 1, 2, 3):
-                    print(f"Invalid --save-captcha value: {bot.save_captcha}. Must be 0-3. Defaulting to 0.")
-                    bot.save_captcha = 0
-            except ValueError:
-                print("Invalid --save-captcha value. Must be 0-3. Defaulting to 0.")
-                bot.save_captcha = 0
 
     token_file = "bot_token.txt"
     if not os.path.exists(token_file):
@@ -1100,6 +1098,11 @@ if __name__ == "__main__":
                 id INTEGER PRIMARY KEY,
                 channelid INTEGER,
                 giftcodestatus TEXT
+            )""")
+
+            conn_settings.execute("""CREATE TABLE IF NOT EXISTS bot_global_settings (
+                setting_key TEXT PRIMARY KEY,
+                setting_value TEXT
             )""")
 
             conn_settings.execute("""CREATE TABLE IF NOT EXISTS admin (
@@ -1171,6 +1174,16 @@ if __name__ == "__main__":
             conn_settings.execute("""CREATE INDEX IF NOT EXISTS idx_permission_audit_timestamp
                 ON permission_audit_log(timestamp DESC)""")
 
+            # Per-alliance opt-in channel summary posted after each redemption.
+            # No row = disabled (default). Buckets choose what the summary lists.
+            conn_settings.execute("""CREATE TABLE IF NOT EXISTS redemption_summary_settings (
+                alliance_id INTEGER PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                show_success INTEGER NOT NULL DEFAULT 0,
+                show_already INTEGER NOT NULL DEFAULT 0,
+                show_failed INTEGER NOT NULL DEFAULT 1
+            )""")
+
         with connections["conn_users"] as conn_users:
             conn_users.execute("""CREATE TABLE IF NOT EXISTS users (
                 fid INTEGER PRIMARY KEY,
@@ -1207,12 +1220,17 @@ if __name__ == "__main__":
             )""")
             
             conn_giftcode.execute("""CREATE TABLE IF NOT EXISTS user_giftcodes (
-                fid INTEGER, 
-                giftcode TEXT, 
-                status TEXT, 
+                fid INTEGER,
+                giftcode TEXT,
+                status TEXT,
+                last_attempt_at TEXT,
                 PRIMARY KEY (fid, giftcode),
                 FOREIGN KEY (giftcode) REFERENCES gift_codes (giftcode)
             )""")
+            # Upgrade path: per-account attempt timestamp for the redeem-results viewer.
+            uc_cols = [row[1] for row in conn_giftcode.execute("PRAGMA table_info(user_giftcodes)").fetchall()]
+            if "last_attempt_at" not in uc_cols:
+                conn_giftcode.execute("ALTER TABLE user_giftcodes ADD COLUMN last_attempt_at TEXT")
 
         with connections["conn_alliance"] as conn_alliance:
             conn_alliance.execute("""CREATE TABLE IF NOT EXISTS alliancesettings (
@@ -1238,6 +1256,17 @@ if __name__ == "__main__":
                     "ALTER TABLE alliancesettings ADD COLUMN silent_notifications INTEGER DEFAULT 0"
                 )
 
+            # Dedicated gift-redemption progress channel
+            try:
+                conn_alliance.execute("SELECT redemption_channel_id FROM alliancesettings LIMIT 1")
+            except sqlite3.OperationalError:
+                conn_alliance.execute(
+                    "ALTER TABLE alliancesettings ADD COLUMN redemption_channel_id INTEGER"
+                )
+                conn_alliance.execute(
+                    "UPDATE alliancesettings SET redemption_channel_id = channel_id"
+                )
+
             # Minutes to wait for more screenshots before auto-finalising an OCR upload.
             try:
                 conn_alliance.execute("SELECT ocr_session_timeout_min FROM alliancesettings LIMIT 1")
@@ -1259,6 +1288,14 @@ if __name__ == "__main__":
             # Upgrade path: per-alliance state lock. NULL = no restriction (legacy behaviour).
             if "kid" not in existing_cols:
                 conn_alliance.execute("ALTER TABLE alliance_list ADD COLUMN kid INTEGER")
+            # Upgrade path: multistate flag - members span many states, never auto-bind to one.
+            if "multistate" not in existing_cols:
+                conn_alliance.execute("ALTER TABLE alliance_list ADD COLUMN multistate INTEGER DEFAULT 0")
+            # Upgrade path: separate the deliberate state-lock from the (auto-bindable) home state.
+            # Any alliance that already had a kid set was an intentional lock -> preserve it.
+            if "state_locked" not in existing_cols:
+                conn_alliance.execute("ALTER TABLE alliance_list ADD COLUMN state_locked INTEGER DEFAULT 0")
+                conn_alliance.execute("UPDATE alliance_list SET state_locked = 1 WHERE kid IS NOT NULL")
 
     create_tables()
     startup.phase_ok("Database ready")
@@ -1331,28 +1368,37 @@ if __name__ == "__main__":
 
                 try:
                     startup.phase_start("Checking Gift Code Redemption API")
-                    proxy_detail = (
-                        f"via proxy {os.environ.get('HTTPS_PROXY')}"
-                        if os.environ.get("HTTPS_PROXY")
-                        else "no proxy"
-                    )
-                    sync_cog = bot.get_cog("AllianceSync")
-                    login_handler = getattr(sync_cog, 'login_handler', None)
-                    if login_handler:
-                        status = await login_handler.check_apis_availability()
-                        # One retry if both report down — parity with the distribution check.
-                        if not (status.get('api1_available') or status.get('api2_available')):
-                            status = await login_handler.check_apis_availability()
-                        if status.get('api1_available') and status.get('api2_available'):
-                            startup.api_status("Gift Code Redemption API", "ok", "Dual-API mode")
-                        elif status.get('api1_available') or status.get('api2_available'):
-                            startup.api_status("Gift Code Redemption API", "ok", "Single-API mode")
-                        else:
-                            startup.api_status("Gift Code Redemption API", "error", proxy_detail)
+                    health = bot.get_cog("BotHealth")
+                    if health is not None:
+                        result = await health.check_wos_api_status()
+                        ok = result.get("status") in ("healthy", "warning")
+                        startup.api_status("Gift Code Redemption API", "ok" if ok else "error", result.get("message"))
                     else:
-                        startup.api_status("Gift Code Redemption API", "error", "Check failed")
+                        startup.api_status("Gift Code Redemption API", "error", "Health cog not loaded")
                 except Exception:
                     startup.api_status("Gift Code Redemption API", "error", "Check failed")
+
+                # OCR status last, after both API checks, for a clean order.
+                try:
+                    from cogs.bear_track import remote_ocr_url, OCR_REMOTE_TOKEN
+                    ocr_url = remote_ocr_url()
+                    if not ocr_url:
+                        startup.phase_ok("Using local OCR")
+                    else:
+                        startup.phase_start("Checking External OCR Service")
+                        try:
+                            async with _aio.ClientSession(timeout=timeout, trust_env=True) as ocr_session:
+                                async with ocr_session.get(
+                                    f"{ocr_url}/health",
+                                    headers={"X-API-Key": OCR_REMOTE_TOKEN},
+                                ) as resp:
+                                    ok = resp.status == 200
+                                    ocr_detail = None if ok else f"HTTP {resp.status}"
+                            startup.api_status("External OCR Service", "ok" if ok else "error", ocr_detail)
+                        except Exception:
+                            startup.api_status("External OCR Service", "error", "Unreachable (using local OCR)")
+                except Exception:
+                    pass
             except Exception:
                 pass
 

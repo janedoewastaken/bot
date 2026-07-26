@@ -15,12 +15,14 @@ import discord
 from .pimp_my_bot import theme
 from .bear_track import _isolate_rtl, _ltr_line
 from .login_handler import LoginHandler
+from . import alliance_power_changes
 from .attendance_ocr_parsers import (
     EVENT_TYPES,
     _STAT_LABELS,
     load_alliance_roster,
     fuzzy_match_name,
     assign_unique_fids,
+    _rematch_displaced_fids,
     update_users_combat_power,
     update_users_power,
     update_users_labyrinth_stages,
@@ -154,6 +156,18 @@ class EventReviewView(discord.ui.View):
                     used.add(cand_fid)
                     open_reg.discard(cand_fid)
                     break
+
+    def _apply_fid_collision(self, bucket, keep_idx, fid) -> list[str]:
+        """After an edit claimed `fid` for `keep_idx`, re-match any other row in
+        `bucket` that also held it; return ephemeral notes on what moved."""
+        notes = []
+        for old_disp, new_fid, new_nick in _rematch_displaced_fids(
+                bucket, keep_idx, fid, self._lookup_nickname):
+            if new_fid:
+                notes.append(f"**{_isolate_rtl(old_disp)}** re-matched to **{_isolate_rtl(new_nick)}**.")
+            else:
+                notes.append(f"**{_isolate_rtl(old_disp)}** now needs review - no other match found.")
+        return notes
 
     def _enrich_rows(self, raw_rows: list[dict], *, kind: str) -> list[dict]:
         enriched = assign_unique_fids(
@@ -476,11 +490,11 @@ class EventReviewView(discord.ui.View):
             icon = theme.deniedIcon if absent else _STATUS_ICON.get(r["status"], "")
             if r["status"] in ("auto", "manual") and r["fid"]:
                 tag_bit = f"[{r['alliance_tag']}] " if r.get("alliance_tag") else ""
-                player = f"`{_isolate_rtl(tag_bit + r['nickname'])}` · `{r['fid']}`"
+                player = f"`{_isolate_rtl(tag_bit + r['nickname'])}` (`{r['fid']}`)"
             elif r["status"] in ("likely", "review") and r["fid"]:
                 tag_bit = f"[{r['alliance_tag']}] " if r.get("alliance_tag") else ""
                 player = (
-                    f"`{_isolate_rtl(tag_bit + r['nickname'])}` ({r['status']}) · `{r['fid']}`"
+                    f"`{_isolate_rtl(tag_bit + r['nickname'])}` ({r['status']}) (`{r['fid']}`)"
                 )
             else:
                 tag_bit = f"[{r['alliance_tag']}] " if r.get("alliance_tag") else ""
@@ -976,10 +990,9 @@ class EventReviewView(discord.ui.View):
                     pass
 
     async def _on_submit(self, interaction: discord.Interaction):
-        try:
+        # Defer first: a power snapshot updates every member and can exceed the 3s window.
+        if not interaction.response.is_done():
             await interaction.response.defer()
-        except (discord.NotFound, discord.HTTPException, discord.InteractionResponded):
-            return
         try:
             session_id, absent_rows = self._persist()
         except Exception as e:
@@ -1030,6 +1043,7 @@ class EventReviewView(discord.ui.View):
             else update_users_power
         )
         ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        self._last_ts = ts
 
         # Power Rankings is a power snapshot, not an event — write users.power for
         # matched rows and record no attendance.
@@ -1306,6 +1320,7 @@ class EventReviewView(discord.ui.View):
         cfg = EVENT_TYPES.get(self.session.event_type)
         label = cfg.label if cfg else self.session.event_type
         updated = getattr(self, "_power_updated_count", 0)
+        matched = [r for r in self.result_rows if r["fid"]]
         unmatched = [r for r in self.result_rows if not r["fid"]]
         desc = [
             f"{theme.upperDivider}",
@@ -1317,6 +1332,19 @@ class EventReviewView(discord.ui.View):
                 f"{theme.warnIcon} `{len(unmatched)}` unmatched row"
                 f"{'s' if len(unmatched) != 1 else ''} skipped — re-upload to assign them."
             )
+        if matched:
+            last_ts = getattr(self, "_last_ts", None)
+            fids = [r["fid"] for r in matched]
+            deltas = alliance_power_changes.deltas_at(fids, "power", last_ts) if last_ts else {}
+            sorted_matched = sorted(matched, key=lambda r: -(r["value"] or 0))
+            desc.append(f"**{theme.listIcon} Updated Players**")
+            for r in sorted_matched:
+                player = r.get("nickname") or r["name"]
+                badge = alliance_power_changes.format_delta(deltas[r["fid"]]["pct"]) if r["fid"] in deltas else ""
+                line = f"• **{player}** — `{_format_compact(r['value'])}`"
+                if badge:
+                    line += f"  {badge}"
+                desc.append(line)
         desc.append(f"{theme.lowerDivider}")
         return discord.Embed(
             title=f"{theme.verifiedIcon} {label} — Power Recorded",
@@ -1641,29 +1669,40 @@ class _EditMergedRowModal(discord.ui.Modal):
         fid, nickname, status, note = await _resolve_player_field(
             interaction, self.view, self.player_input.value)
         name = self.player_input.value.strip()
+        displaced = []
         # Update the row in place (keeps its OCR name for the alias DB); if a
         # bucket has no row yet but a value was entered, create one.
         if self.reg_value_input is not None:
-            self._apply(self.view.registered_rows, self.reg_idx,
-                        _parse_value_input(self.reg_value_input.value) or 0,
-                        "registration", fid, nickname, status, name)
+            reg_i = self._apply(self.view.registered_rows, self.reg_idx,
+                                _parse_value_input(self.reg_value_input.value) or 0,
+                                "registration", fid, nickname, status, name)
+            if fid and reg_i is not None:
+                displaced += self.view._apply_fid_collision(self.view.registered_rows, reg_i, fid)
         if self.res_value_input is not None:
-            self._apply(self.view.result_rows, self.res_idx,
-                        _parse_value_input(self.res_value_input.value) or 0,
-                        "result", fid, nickname, status, name)
+            res_i = self._apply(self.view.result_rows, self.res_idx,
+                                _parse_value_input(self.res_value_input.value) or 0,
+                                "result", fid, nickname, status, name)
+            if fid and res_i is not None:
+                displaced += self.view._apply_fid_collision(self.view.result_rows, res_i, fid)
         await self.view._save_edit(interaction)
-        # Only surface the match note when the player was actually changed.
+        messages = []
         if note and name != self._orig_player:
-            await interaction.followup.send(note, ephemeral=True)
+            messages.append(note)
+        messages.extend(displaced)
+        if messages:
+            await interaction.followup.send("\n".join(messages), ephemeral=True)
 
     @staticmethod
-    def _apply(bucket, idx, value, kind, fid, nickname, status, name) -> None:
+    def _apply(bucket, idx, value, kind, fid, nickname, status, name) -> Optional[int]:
         if idx is not None and idx < len(bucket):
             bucket[idx].update(
                 {"value": value, "fid": fid, "nickname": nickname, "status": status})
+            return idx
         elif value:
             bucket.append({"name": nickname or name, "value": value, "fid": fid,
                            "nickname": nickname, "status": status, "_kind": kind})
+            return len(bucket) - 1
+        return None
 
     def _underlying_targets(self) -> list[tuple[list[dict], Optional[int]]]:
         return [
@@ -1718,10 +1757,14 @@ class _EditRowModal(discord.ui.Modal):
         # Update in place so the original OCR name (alias key) and _kind survive.
         self.bucket[self.local_idx].update(
             {"value": value, "fid": fid, "nickname": nickname, "status": status})
+        displaced = self.view._apply_fid_collision(self.bucket, self.local_idx, fid) if fid else []
         await self.view._save_edit(interaction)
-        # Only surface the match note when the player was actually changed.
+        messages = []
         if note and self.player_input.value.strip() != self._orig_player:
-            await interaction.followup.send(note, ephemeral=True)
+            messages.append(note)
+        messages.extend(displaced)
+        if messages:
+            await interaction.followup.send("\n".join(messages), ephemeral=True)
 
 
 class _AddRowModal(discord.ui.Modal):
@@ -1772,9 +1815,14 @@ class _AddRowModal(discord.ui.Modal):
         bucket = (self.view.registered_rows if self.kind == "registration"
                   else self.view.result_rows)
         bucket.append(new_row)
+        displaced = self.view._apply_fid_collision(bucket, len(bucket) - 1, fid) if fid else []
         await self.view._save_edit(interaction)
+        messages = []
         if note:
-            await interaction.followup.send(note, ephemeral=True)
+            messages.append(note)
+        messages.extend(displaced)
+        if messages:
+            await interaction.followup.send("\n".join(messages), ephemeral=True)
 
 
 class _AddRowBucketView(discord.ui.View):

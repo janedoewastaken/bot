@@ -19,6 +19,28 @@ from .pimp_my_bot import theme, safe_edit_message
 
 logger = logging.getLogger('notification')
 
+def _format_paused_line(event_type, hour, minute, timezone, description, channel_label=None):
+    """One human-readable line per paused notification for the quarantine DM."""
+    description = description or ""
+    if description.startswith("CUSTOM_TIMES:"):
+        parts = description.split("|", 1)
+        description = parts[1] if len(parts) > 1 else ""
+    short = (description[:50] + "...") if len(description) > 50 else description
+    if "EMBED_MESSAGE:" in short:
+        short = "(Embed notification)"
+    where = f" in {channel_label}" if channel_label else ""
+    return f"- **{event_type or 'Custom'} {hour:02d}:{minute:02d} ({timezone})**{where} - {short}"
+
+
+# Friendly wording for pause reasons shown to admins (console + quarantine DM).
+_PAUSE_REASON_PHRASES = {
+    "channel_deleted": "the channel was deleted",
+    "channel_forbidden": "the bot lost access to the channel",
+    "send_forbidden": "the bot lost permission to send in the channel",
+    "guild_kicked": "the bot was removed from the server",
+    "startup_sweep": "the bot is no longer in the server",
+}
+
 
 def check_mention_placeholder_misuse(text: str, is_embed: bool = False) -> str | None:
     """
@@ -155,9 +177,14 @@ class NotificationSystem(commands.Cog):
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.commit()
 
-        # Track when channels were first seen as missing (channel_id -> first_seen_missing timestamp)
-        self.channel_missing_since = {}
-        self.CHANNEL_MISSING_THRESHOLD = 1800  # Confirm and auto-disable after 30 minutes
+        # Channel access is confirmed only when a notification is actually due to send.
+        # (channel_id -> {'fails', 'last'}).
+        self.channel_confirm_state = {}
+        self.CHANNEL_CONFIRM_INTERVAL = 300    # re-confirm at most every 5 minutes
+        self.CHANNEL_CONFIRM_REQUIRED = 3      # confirmation failures before pausing
+
+        # Tracks Forbidden from actual sends, separate from the cache-miss state above.
+        self.send_forbidden_state = {}
 
         # repeat_minutes value -1 means weekday-based repeat, 0 means no repeat
         self.cursor.execute("""
@@ -216,6 +243,15 @@ class NotificationSystem(commands.Cog):
             )
         """)
 
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS event_reference_overrides (
+                guild_id INTEGER,
+                event_type TEXT,
+                reference_date TEXT,
+                PRIMARY KEY (guild_id, event_type)
+            )
+        """)
+
         # Fix corrupted weekday-based repeats: "fixed" string was silently converted to 0 by SQLite.
         self.cursor.execute("""
             UPDATE bear_notifications
@@ -242,6 +278,10 @@ class NotificationSystem(commands.Cog):
             self.cursor.execute("SELECT instance_identifier FROM bear_notifications LIMIT 1")
         except sqlite3.OperationalError:
             self.cursor.execute("ALTER TABLE bear_notifications ADD COLUMN instance_identifier TEXT")
+        try:
+            self.cursor.execute("SELECT auto_disabled_at FROM bear_notifications LIMIT 1")
+        except sqlite3.OperationalError:
+            self.cursor.execute("ALTER TABLE bear_notifications ADD COLUMN auto_disabled_at TEXT")
 
         # Message deletion settings
         self.cursor.execute("""
@@ -258,6 +298,12 @@ class NotificationSystem(commands.Cog):
             self.cursor.execute("SELECT custom_delete_delay_minutes FROM bear_notifications LIMIT 1")
         except sqlite3.OperationalError:
             self.cursor.execute("ALTER TABLE bear_notifications ADD COLUMN custom_delete_delay_minutes INTEGER DEFAULT NULL")
+
+        # Last-known channel name, so quarantine messages can name a deleted channel
+        try:
+            self.cursor.execute("SELECT channel_name FROM bear_notifications LIMIT 1")
+        except sqlite3.OperationalError:
+            self.cursor.execute("ALTER TABLE bear_notifications ADD COLUMN channel_name TEXT DEFAULT NULL")
 
         # Add message tracking columns to notification_history
         try:
@@ -312,27 +358,63 @@ class NotificationSystem(commands.Cog):
         if hasattr(self, 'conn'):
             self.conn.close()
 
-    async def auto_disable_notification(self, channel_id: int):
+    async def _resolve_send_channel(self, channel_id: int):
+        """Resolve the channel to deliver to, checked only when a notification is
+        actually due. Returns a reachable channel (from cache, or a live fetch if
+        it just was not cached), or None if it is unreachable or was recently
+        checked. After repeated confirmed failures it pauses the channel's
+        notifications; a single transient blip does not pause."""
+        channel = self.bot.get_channel(channel_id)
+        if channel is not None:
+            self.channel_confirm_state.pop(channel_id, None)
+            return channel
+
+        # Not in cache - throttle how often we hit the API to confirm access.
+        state = self.channel_confirm_state.setdefault(channel_id, {'fails': 0, 'last': 0.0})
         now = time.time()
-        if channel_id not in self.channel_missing_since:
-            self.channel_missing_since[channel_id] = now
-            return
-        if now - self.channel_missing_since[channel_id] < self.CHANNEL_MISSING_THRESHOLD:
-            return
+        if now - state['last'] < self.CHANNEL_CONFIRM_INTERVAL:
+            return None
+        state['last'] = now
 
         try:
-            await self.bot.fetch_channel(channel_id)
-            self.channel_missing_since.pop(channel_id, None)
-            return
-        except discord.NotFound:
-            reason = "channel_deleted"
-        except discord.Forbidden:
-            reason = "channel_forbidden"
-        except Exception:
-            return  # transient (rate limit, network) — keep waiting
+            channel = await self.bot.fetch_channel(channel_id)
+            # Reachable, it just was not cached - deliver via this and clear state.
+            self.channel_confirm_state.pop(channel_id, None)
+            return channel
+        except discord.NotFound as e:
+            reason, err = "channel_deleted", e
+        except discord.Forbidden as e:
+            reason, err = "channel_forbidden", e
+        except Exception as e:
+            # Transient (rate limit, network) - skip this send, do not count it.
+            logger.warning(f"Notifications: transient error resolving channel {channel_id}: {type(e).__name__}: {e}")
+            return None
 
-        self.channel_missing_since.pop(channel_id, None)
-        await self._pause_and_notify(channel_id=channel_id, reason=reason)
+        state['fails'] += 1
+        logger.warning(
+            f"Notifications: channel {channel_id} unreachable ({reason}: {err}); "
+            f"confirmation {state['fails']}/{self.CHANNEL_CONFIRM_REQUIRED}"
+        )
+        if state['fails'] >= self.CHANNEL_CONFIRM_REQUIRED:
+            self.channel_confirm_state.pop(channel_id, None)
+            await self._pause_and_notify(channel_id=channel_id, reason=reason)
+        return None
+
+    async def _handle_send_forbidden(self, channel_id: int):
+        """Count throttled 403-send confirmations; pause the channel after repeated failures."""
+        state = self.send_forbidden_state.setdefault(channel_id, {'fails': 0, 'last': 0.0})
+        now = time.time()
+        if now - state['last'] < self.CHANNEL_CONFIRM_INTERVAL:
+            return
+        state['last'] = now
+        state['fails'] += 1
+        logger.warning(
+            f"Notifications: send to channel {channel_id} forbidden; "
+            f"confirmation {state['fails']}/{self.CHANNEL_CONFIRM_REQUIRED}"
+        )
+        if state['fails'] >= self.CHANNEL_CONFIRM_REQUIRED:
+            self.send_forbidden_state.pop(channel_id, None)
+            await self._pause_and_notify(channel_id=channel_id, reason="send_forbidden")
 
     async def _pause_and_notify(self, *, channel_id: int | None = None,
                                 guild_id: int | None = None, reason: str):
@@ -344,7 +426,8 @@ class NotificationSystem(commands.Cog):
             return 0
         try:
             self.cursor.execute(
-                f"SELECT id, description, guild_id FROM bear_notifications "
+                f"SELECT id, description, guild_id, event_type, hour, minute, timezone, "
+                f"channel_id, channel_name FROM bear_notifications "
                 f"WHERE {where_sql} AND is_enabled = 1",
                 where_params,
             )
@@ -352,6 +435,7 @@ class NotificationSystem(commands.Cog):
             if not affected:
                 return 0
             gid = affected[0][2]
+            channel_label = self._channel_label(channel_id, affected[0][8]) if channel_id else None
             ts_iso = datetime.now(pytz.UTC).isoformat()
             self.cursor.execute(
                 f"UPDATE bear_notifications SET is_enabled = 0, auto_disabled_at = ? "
@@ -359,10 +443,12 @@ class NotificationSystem(commands.Cog):
                 (ts_iso, *where_params),
             )
             self.conn.commit()
-            print(f"[NOTIFICATIONS] Paused {len(affected)} notification(s) — {reason}")
+            logger.info(f"Notifications: paused {len(affected)} notification(s) - {reason} (guild {gid}, channel {channel_id})")
+            in_channel = f" in {channel_label}" if channel_label else ""
+            print(f"[NOTIFICATIONS] Paused {len(affected)} notification(s){in_channel} - {_PAUSE_REASON_PHRASES.get(reason, reason)}")
             await self._send_quarantine_dm(
                 ts_iso=ts_iso, guild_id=gid, channel_id=channel_id,
-                reason=reason, affected=[(r[0], r[1]) for r in affected],
+                channel_label=channel_label, reason=reason, affected=affected,
             )
             return len(affected)
         except Exception as e:
@@ -370,8 +456,17 @@ class NotificationSystem(commands.Cog):
             print(f"[NOTIFICATIONS] Could not pause notifications: {e}")
             return 0
 
+    def _channel_label(self, channel_id, last_known_name=None):
+        """Best available human name for a channel, surviving its deletion."""
+        channel = self.bot.get_channel(channel_id) if channel_id else None
+        if channel is not None:
+            return f"#{channel.name}"
+        if last_known_name:
+            return f"#{last_known_name} (deleted)"
+        return f"channel ID {channel_id}"
+
     async def _send_quarantine_dm(self, *, ts_iso, guild_id, channel_id,
-                                  reason, affected):
+                                  reason, affected, channel_label=None):
         try:
             with sqlite3.connect('db/settings.sqlite') as db:
                 admins = db.cursor().execute(
@@ -381,20 +476,14 @@ class NotificationSystem(commands.Cog):
                 return
             guild = self.bot.get_guild(guild_id)
             guild_label = f"**{guild.name}**" if guild else f"guild `{guild_id}`"
-            scope = (f"channel `{channel_id}` in {guild_label}"
-                     if channel_id else guild_label)
-            reason_phrase = {
-                "channel_deleted": "the channel was deleted",
-                "channel_forbidden": "the bot lost access to the channel",
-                "guild_kicked": "the bot was removed from the server",
-                "startup_sweep": "the bot is no longer in the server",
-            }.get(reason, reason)
+            scope = f"{channel_label} in {guild_label}" if channel_label else guild_label
+            reason_phrase = _PAUSE_REASON_PHRASES.get(reason, reason)
             notif_lines = []
-            for nid, desc in affected[:10]:
-                short = (desc[:50] + "...") if len(desc) > 50 else desc
-                if "EMBED_MESSAGE:" in short:
-                    short = "(Embed notification)"
-                notif_lines.append(f"- **ID {nid}:** {short}")
+            for row in affected[:10]:
+                _nid, desc, _gid, event_type, hour, minute, tz_name, row_channel_id, row_channel_name = row
+                # Guild-wide pauses span channels, so name each one per line.
+                per_line_label = None if channel_label else self._channel_label(row_channel_id, row_channel_name)
+                notif_lines.append(_format_paused_line(event_type, hour, minute, tz_name, desc, per_line_label))
             more = (f"\n*…and {len(affected) - 10} more*"
                     if len(affected) > 10 else "")
             embed = discord.Embed(
@@ -486,14 +575,15 @@ class NotificationSystem(commands.Cog):
             )
             next_notification = tz.localize(naive_dt)
 
+            channel_name = getattr(self.bot.get_channel(channel_id), "name", None)
             self.cursor.execute("""
                 INSERT INTO bear_notifications
                 (guild_id, channel_id, hour, minute, timezone, description, notification_type,
-                mention_type, repeat_enabled, repeat_minutes, created_by, next_notification, event_type, wizard_batch_id, instance_identifier)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                mention_type, repeat_enabled, repeat_minutes, created_by, next_notification, event_type, wizard_batch_id, instance_identifier, channel_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (guild_id, channel_id, hour, minute, timezone, notification_description, notification_type,
                   mention_type, 1 if repeat_enabled else 0, repeat_minutes, created_by,
-                  next_notification.isoformat(), event_type, wizard_batch_id, instance_identifier))
+                  next_notification.isoformat(), event_type, wizard_batch_id, instance_identifier, channel_name))
 
             notification_id = self.cursor.lastrowid
 
@@ -547,18 +637,21 @@ class NotificationSystem(commands.Cog):
             self.cursor.execute("""
                 UPDATE bear_notifications
                 SET hour = ?, minute = ?, timezone = ?, description = ?, notification_type = ?,
-                    mention_type = ?, repeat_minutes = ?, event_type = ?, next_notification = ?,
-                    instance_identifier = ?
+                    mention_type = ?, repeat_enabled = ?, repeat_minutes = ?, event_type = ?,
+                    next_notification = ?, instance_identifier = ?
                 WHERE id = ?
             """, (hour, minute, timezone, notification_description, notification_type,
-                  mention_type, repeat_minutes, event_type, next_notification.isoformat(),
-                  instance_identifier, notification_id))
+                  mention_type, 1 if repeat_minutes != 0 else 0, repeat_minutes, event_type,
+                  next_notification.isoformat(), instance_identifier, notification_id))
             if embed_data:
                 self.cursor.execute("DELETE FROM bear_notification_embeds WHERE notification_id = ?", (notification_id,))
                 await self.save_notification_embed(notification_id, embed_data)
             if repeat_minutes == -1 and selected_weekdays:
                 self.cursor.execute("DELETE FROM notification_days WHERE notification_id = ?", (notification_id,))
                 await self.save_notification_fixed(notification_id, selected_weekdays)
+            elif repeat_minutes != -1:
+                # Leaving weekday mode drops the day rows, or the startup repair migration re-enables them.
+                self.cursor.execute("DELETE FROM notification_days WHERE notification_id = ?", (notification_id,))
             self.conn.commit()
             if not skip_board_update:
                 schedule_cog = self.bot.get_cog("NotificationSchedule")
@@ -861,14 +954,6 @@ class NotificationSystem(commands.Cog):
             if not is_enabled:
                 return
 
-            channel = self.bot.get_channel(channel_id)
-            if not channel:
-                await self.auto_disable_notification(channel_id)
-                return
-
-            # Channel found — clear any missing tracker
-            self.channel_missing_since.pop(channel_id, None)
-
             tz = pytz.timezone(timezone)
             now = datetime.now(tz)
             next_time = datetime.fromisoformat(next_notification)
@@ -948,7 +1033,8 @@ class NotificationSystem(commands.Cog):
             for notify_time in notification_times:
                 time_diff = abs(minutes_until - notify_time)
                 if time_diff < 0.1:
-                    thirty_seconds_ago = (now - timedelta(seconds=30)).strftime('%Y-%m-%d %H:%M:%S')
+                    # sent_at is stored as UTC wall time - compare in UTC, not the notification's timezone.
+                    thirty_seconds_ago = (datetime.now(pytz.UTC) - timedelta(seconds=30)).strftime('%Y-%m-%d %H:%M:%S')
 
                     self.cursor.execute("""
                         SELECT COUNT(*) FROM notification_history 
@@ -964,6 +1050,16 @@ class NotificationSystem(commands.Cog):
                     break
 
             if should_notify:
+                # Resolve the channel only now, when we are actually about to send.
+                channel = await self._resolve_send_channel(channel_id)
+                if channel is None:
+                    return
+
+                # Recent Forbidden send: skip re-sends until the next confirmation window.
+                fb_state = self.send_forbidden_state.get(channel_id)
+                if fb_state and time.time() - fb_state['last'] < self.CHANNEL_CONFIRM_INTERVAL:
+                    return
+
                 # Delete previous notifications before sending new ones
                 await self.delete_previous_notifications(id, channel_id, event_type, instance_identifier)
 
@@ -1215,6 +1311,16 @@ class NotificationSystem(commands.Cog):
                             msg = await channel.send(f"{mention_text} ⏰ **{actual_description}**")
                         sent_message_ids.append(msg.id)
 
+                # Sends succeeded: clear Forbidden confirmations and refresh the last-known channel name.
+                self.send_forbidden_state.pop(channel_id, None)
+                channel_name = getattr(channel, "name", None)
+                if channel_name:
+                    self.cursor.execute(
+                        "UPDATE bear_notifications SET channel_name = ? "
+                        "WHERE id = ? AND (channel_name IS NULL OR channel_name != ?)",
+                        (channel_name, id, channel_name),
+                    )
+
                 # Calculate when to delete messages
                 scheduled_delete_at = self.calculate_delete_time(
                     guild_id, event_type, custom_delete_delay_minutes,
@@ -1296,6 +1402,9 @@ class NotificationSystem(commands.Cog):
                 if schedule_cog:
                     await schedule_cog.on_notification_sent(guild_id, channel_id)
 
+        except discord.Forbidden:
+            # Send permission lost on a cached channel: quarantine instead of retrying forever.
+            await self._handle_send_forbidden(channel_id)
         except Exception as e:
             notif_id = id if id is not None else "unknown"
             error_msg = f"[ERROR] Error processing notification {notif_id}: {str(e)}\nType: {type(e)}\nTrace: {traceback.format_exc()}"
@@ -1922,6 +2031,8 @@ class EmbedEditorView(discord.ui.View):
 
             def replace_variables(text):
                 """Replace all notification variables with sample values for preview."""
+                if not text:
+                    return text
                 return (text
                     .replace("%t", example_time)
                     .replace("{time}", example_time)
@@ -1932,13 +2043,15 @@ class EmbedEditorView(discord.ui.View):
 
             embed = discord.Embed(color=self.embed_data.get("color", discord.Color.blue().value))
 
-            if "title" in self.embed_data:
+            # Guard on value, not key presence: author/mention default to None and
+            # a loaded template can store NULL fields, which would break .replace().
+            if self.embed_data.get("title"):
                 embed.title = replace_variables(self.embed_data["title"])
-            if "description" in self.embed_data:
+            if self.embed_data.get("description"):
                 embed.description = replace_variables(self.embed_data["description"])
-            if "footer" in self.embed_data:
+            if self.embed_data.get("footer"):
                 embed.set_footer(text=replace_variables(self.embed_data["footer"]))
-            if "author" in self.embed_data:
+            if self.embed_data.get("author"):
                 embed.set_author(name=replace_variables(self.embed_data["author"]))
             if "image_url" in self.embed_data and self.embed_data["image_url"]:
                 embed.set_image(url=self.embed_data["image_url"])
@@ -3887,12 +4000,12 @@ class BearTrapView(discord.ui.View):
                                             )
                                             return
 
-                                        # Update the notification's channel
+                                        # Update the notification's channel (and its last-known name)
                                         self.cog.cursor.execute("""
                                             UPDATE bear_notifications
-                                            SET channel_id = ?
+                                            SET channel_id = ?, channel_name = ?
                                             WHERE id = ?
-                                        """, (new_channel_id, self.notification_id))
+                                        """, (new_channel_id, getattr(new_channel, "name", None), self.notification_id))
                                         self.cog.conn.commit()
 
                                         await select_interaction.response.send_message(
@@ -4158,14 +4271,25 @@ class ChannelSelectMenu(discord.ui.ChannelSelect):
     async def callback(self, interaction: discord.Interaction):
         try:
             channel = self.values[0]
+            # Diagnostic context: what the picker handed us vs what the cache resolved.
+            sel_info = (
+                f"id={channel.id} name={getattr(channel, 'name', '?')} "
+                f"type={getattr(channel, 'type', '?')} guild={interaction.guild.id}"
+            )
             actual_channel = interaction.guild.get_channel(channel.id)
             if not actual_channel:
+                # get_channel is cache-only and never resolves threads; log what was
+                # selected so we can tell a thread/forum from a genuine cache miss.
+                logger.warning(f"Notification channel select: get_channel() returned None for {sel_info}")
+                print(f"Notification channel select: get_channel() returned None for {sel_info}")
                 await interaction.response.send_message(
                     f"{theme.deniedIcon} Channel not found or inaccessible!",
                     ephemeral=True
                 )
                 return
             if not actual_channel.permissions_for(interaction.guild.me).send_messages:
+                logger.warning(f"Notification channel select: missing send_messages permission for {sel_info}")
+                print(f"Notification channel select: missing send_messages permission for {sel_info}")
                 await interaction.response.send_message(
                     f"{theme.deniedIcon} I don't have permission to send messages in this channel!",
                     ephemeral=True

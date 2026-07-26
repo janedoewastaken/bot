@@ -8,7 +8,7 @@ import sqlite3
 import asyncio
 import logging
 from .permission_handler import PermissionManager
-from .pimp_my_bot import theme, safe_edit_message
+from .pimp_my_bot import theme, safe_edit_message, notify_view_expired
 from .process_queue import ALLIANCE_CONTROL
 
 logger = logging.getLogger('alliance')
@@ -22,11 +22,14 @@ STATE_CHECK_UNAVAILABLE = (
 
 
 def resolve_alliance_kid(alliance_id: int):
-    """Read the alliance's locked kid -> (ok, kid); ok=False means fail closed."""
+    """Read the alliance's LOCK state -> (ok, locked_kid). `locked_kid` is None unless the
+    alliance is explicitly state-locked, so `kid` alone (an auto-bound home state) never
+    rejects adds - only a deliberate lock does. ok=False means fail closed (read error)."""
     try:
         with sqlite3.connect("db/alliance.sqlite", timeout=30.0) as conn:
             row = conn.execute(
-                "SELECT kid FROM alliance_list WHERE alliance_id = ?", (alliance_id,)
+                "SELECT kid, COALESCE(state_locked, 0) FROM alliance_list WHERE alliance_id = ?",
+                (alliance_id,),
             ).fetchone()
     except sqlite3.OperationalError as e:
         msg = str(e).lower()
@@ -35,7 +38,10 @@ def resolve_alliance_kid(alliance_id: int):
         logger.warning(f"State gate read failed for alliance {alliance_id}: {e}")
         print(f"State gate read failed for alliance {alliance_id}: {e}")
         return False, None
-    return True, (row[0] if row else None)
+    if not row:
+        return True, None
+    kid, locked = row
+    return True, (kid if locked else None)
 
 
 def state_lock_reason(alliance_kid, player_kid) -> "str | None":
@@ -362,7 +368,15 @@ class Alliance(commands.Cog):
         await self.add_alliance(interaction)
 
     async def sync_all_alliances(self, interaction: discord.Interaction):
-        """Enqueue an alliance_sync_manual for every alliance the admin can access."""
+        """Alliance sync is disabled - there is no player-data API to refresh from."""
+        await interaction.response.send_message(
+            f"{theme.warnIcon} Alliance sync is no longer available - member nicknames, levels "
+            f"and states can't be refreshed automatically. Set member states under "
+            f"**Alliance Management -> Member States**.",
+            ephemeral=True,
+        )
+        return
+
         try:
             allowed_alliance_ids, is_global = PermissionManager.get_admin_alliance_ids(
                 interaction.user.id, interaction.guild_id
@@ -464,7 +478,9 @@ class Alliance(commands.Cog):
                             (alliance_id,),
                         )
                         channel_data = cursor.fetchone()
-                    channel = self.bot.get_channel(channel_data[0]) if channel_data else interaction.channel
+                    # Only a NULL channel_id (new alliance) falls back here; unreachable configured channels still skip.
+                    channel_id = channel_data[0] if channel_data else None
+                    channel = self.bot.get_channel(channel_id) if channel_id else interaction.channel
                     if not channel:
                         continue
 
@@ -519,11 +535,11 @@ class Alliance(commands.Cog):
         )
 
     async def show_edit_state_for(self, interaction: discord.Interaction, alliance_id: int):
-        """Open the per-alliance State modal. Empty stores NULL (no lock)."""
+        """Open the per-alliance state-lock modal. Empty clears the lock."""
         with sqlite3.connect('db/alliance.sqlite', timeout=30.0) as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT name, kid FROM alliance_list WHERE alliance_id = ?",
+                "SELECT name, kid, COALESCE(state_locked, 0) FROM alliance_list WHERE alliance_id = ?",
                 (alliance_id,),
             )
             row = cursor.fetchone()
@@ -532,9 +548,10 @@ class Alliance(commands.Cog):
                 f"{theme.deniedIcon} Alliance not found.", ephemeral=True
             )
             return
-        alliance_name, current_kid = row
+        alliance_name, kid, locked = row
+        current_lock = kid if locked else None
         await interaction.response.send_modal(
-            EditStateModal(alliance_id, alliance_name, current_kid, self.conn, self.bot)
+            EditStateModal(alliance_id, alliance_name, current_lock, self.conn, self.bot)
         )
 
     async def show_edit_alliance_for(self, interaction: discord.Interaction, alliance_id: int):
@@ -821,7 +838,9 @@ class Alliance(commands.Cog):
                                                 SELECT channel_id FROM alliancesettings WHERE alliance_id = ?
                                             """, (alliance_id,))
                                             channel_data = cursor.fetchone()
-                                        channel = self.bot.get_channel(channel_data[0]) if channel_data else select_interaction.channel
+                                        # Only a NULL channel_id falls back to the invoking channel, matching Sync All.
+                                        channel_id = channel_data[0] if channel_data else None
+                                        channel = self.bot.get_channel(channel_id) if channel_id else select_interaction.channel
                                         if not channel:
                                             continue
 
@@ -1597,14 +1616,71 @@ class AllianceModal(discord.ui.Modal):
         self.interaction = interaction
 
 
+class PostCreateChannelPromptView(discord.ui.View):
+    """One-shot prompt after Add Alliance: set up channels now, or skip to the hub."""
+
+    def __init__(self, cog, alliance_id: int, alliance_name: str):
+        super().__init__(timeout=7200)
+        self.cog = cog
+        self.alliance_id = alliance_id
+        self.alliance_name = alliance_name
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        is_admin, _ = PermissionManager.is_admin(interaction.user.id)
+        if not is_admin:
+            await interaction.response.send_message(
+                f"{theme.deniedIcon} Admins only.", ephemeral=True
+            )
+        return is_admin
+
+    def build_embed(self) -> discord.Embed:
+        return discord.Embed(
+            title=f"{theme.verifiedIcon} Alliance Created: {self.alliance_name}",
+            description=(
+                f"{theme.upperDivider}\n"
+                f"Set up this alliance's channels now. A Sync Log and Redemption Log "
+                f"are recommended so sync results and gift redemptions get logged.\n\n"
+                f"**Controls**\n"
+                f"{theme.settingsIcon} **Set Up Channels**\n"
+                f"└ Configure the ID, Activity Log, Sync Log, and Redemption Log channels\n\n"
+                f"{theme.forwardIcon} **Skip for Now**\n"
+                f"└ Go to the alliance hub (Channel Setup stays available there)\n"
+                f"{theme.lowerDivider}"
+            ),
+            color=theme.emColor1,
+        )
+
+    @discord.ui.button(label="Set Up Channels", emoji=theme.settingsIcon, style=discord.ButtonStyle.primary)
+    async def setup_channels(self, interaction: discord.Interaction, button: discord.ui.Button):
+        channels_cog = self.cog.bot.get_cog("AllianceChannels")
+        if not channels_cog:
+            await interaction.response.send_message(
+                f"{theme.deniedIcon} Channel Setup module not found.", ephemeral=True
+            )
+            return
+        self.stop()
+        await channels_cog.show_channel_setup_for(interaction, self.alliance_id)
+
+    @discord.ui.button(label="Skip for Now", emoji=theme.forwardIcon, style=discord.ButtonStyle.secondary)
+    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        main_menu = self.cog.bot.get_cog("MainMenu")
+        if main_menu:
+            await main_menu.show_alliance_hub(interaction, self.alliance_id)
+
+    async def on_timeout(self):
+        await notify_view_expired(self, "alliance setup prompt")
+
+
 class AddAllianceModal(discord.ui.Modal):
     """Two-field alliance creator. Inserts a new alliance with safe defaults
-    (interval=60min, no channel, no start time). The optional State (#) field
-    locks the alliance to a single state so non-matching players are rejected
-    on add — leave blank for no restriction. Channels and sync settings are
-    configured post-creation via Channel Setup / Sync Settings."""
+    (interval=1440min / once a day, no channel, no start time). The optional
+    State (#) field sets the alliance's home state for redemption and member
+    backfill - leave blank for none. Locking is a separate toggle on the hub.
+    Creation ends on a prompt encouraging Channel Setup for the new alliance."""
 
-    DEFAULT_INTERVAL_MINUTES = 60
+    # Daily by default
+    DEFAULT_INTERVAL_MINUTES = 1440
 
     def __init__(self, cog):
         super().__init__(title="Add Alliance")
@@ -1618,7 +1694,7 @@ class AddAllianceModal(discord.ui.Modal):
         self.add_item(self.name_input)
         self.kid_input = discord.ui.TextInput(
             label="State # (optional)",
-            placeholder="Leave blank for no state restriction",
+            placeholder="The alliance's home state number",
             required=False,
             max_length=10,
         )
@@ -1661,8 +1737,8 @@ class AddAllianceModal(discord.ui.Modal):
                     return
 
                 cursor.execute(
-                    "INSERT INTO alliance_list (name, discord_server_id, kid) "
-                    "VALUES (?, ?, ?)",
+                    "INSERT INTO alliance_list (name, discord_server_id, kid, state_locked) "
+                    "VALUES (?, ?, ?, 0)",
                     (alliance_name,
                      interaction.guild.id if interaction.guild else None,
                      parsed_kid),
@@ -1683,18 +1759,13 @@ class AddAllianceModal(discord.ui.Modal):
                 )
                 conn.commit()
 
-            # Drop the user straight onto the new alliance's hub — no
-            # intermediate "created" ephemeral. The hub itself confirms the
-            # alliance exists, and Channel Setup is one click away.
-            main_menu = self.cog.bot.get_cog("MainMenu")
-            if main_menu:
-                await main_menu.show_alliance_hub(interaction, alliance_id)
-            else:
-                await interaction.response.send_message(
-                    f"{theme.verifiedIcon} Alliance **{alliance_name}** "
-                    f"(ID `{alliance_id}`) created.",
-                    ephemeral=True,
-                )
+            # End on a channel-setup prompt so new alliances get their log channels configured up front.
+            view = PostCreateChannelPromptView(self.cog, alliance_id, alliance_name)
+            await safe_edit_message(interaction, embed=view.build_embed(), view=view, content=None)
+            try:
+                view.message = await interaction.original_response()
+            except Exception:
+                pass
 
         except Exception as e:
             logger.error(f"Error creating alliance '{alliance_name}': {e}")
@@ -1760,9 +1831,9 @@ class EditNameModal(discord.ui.Modal):
 
 
 class EditStateModal(discord.ui.Modal):
-    """Single-field editor for an alliance's locked State. Empty input clears
-    the lock (sets kid to NULL); a positive integer locks the alliance to that
-    state so non-matching players are rejected at add-time."""
+    """Single-field editor for an alliance's home State (kid). A positive integer
+    sets the home state used for redemption and member backfill; empty input clears
+    it. This does NOT lock the alliance - locking is a separate toggle on the hub."""
 
     def __init__(self, alliance_id: int, alliance_name: str,
                  current_kid, conn, bot):
@@ -1772,8 +1843,8 @@ class EditStateModal(discord.ui.Modal):
         self.conn = conn
         self.bot = bot
         self.kid_input = discord.ui.TextInput(
-            label="State # (blank = no lock)",
-            placeholder="Leave blank to clear the state restriction",
+            label="State # (blank = clear)",
+            placeholder="The alliance's state number",
             default=("" if current_kid is None else str(current_kid)),
             required=False,
             max_length=10,
@@ -1797,10 +1868,18 @@ class EditStateModal(discord.ui.Modal):
                 return
         try:
             cursor = self.conn.cursor()
-            cursor.execute(
-                "UPDATE alliance_list SET kid = ? WHERE alliance_id = ?",
-                (new_kid, self.alliance_id),
-            )
+            if new_kid is not None:
+                # Set the home state; leave any existing lock in place (now applies to it).
+                cursor.execute(
+                    "UPDATE alliance_list SET kid = ?, multistate = 0 WHERE alliance_id = ?",
+                    (new_kid, self.alliance_id),
+                )
+            else:
+                # Clearing the home state can't leave a lock pointing at nothing.
+                cursor.execute(
+                    "UPDATE alliance_list SET kid = NULL, state_locked = 0 WHERE alliance_id = ?",
+                    (self.alliance_id,),
+                )
             self.conn.commit()
         except Exception as e:
             logger.error(f"Error setting state on alliance {self.alliance_id}: {e}")
@@ -1815,13 +1894,13 @@ class EditStateModal(discord.ui.Modal):
 
         if new_kid is None:
             result = (
-                f"{theme.verifiedIcon} **{self.alliance_name}** state lock cleared. "
-                f"Players from any state can now be added."
+                f"{theme.verifiedIcon} **{self.alliance_name}** home state cleared."
             )
         else:
             result = (
-                f"{theme.verifiedIcon} **{self.alliance_name}** locked to State #{new_kid}. "
-                f"Only players in this state can be added going forward."
+                f"{theme.verifiedIcon} **{self.alliance_name}** home state set to #{new_kid}. "
+                f"Members can inherit it and redemption will use it. Use **State Lock** to also "
+                f"reject players from other states."
             )
 
         # Return to the hub and report the result as a dismissible ephemeral.

@@ -177,6 +177,23 @@ class AllianceSync(commands.Cog):
         # Default to 0 (disabled) if not set
         return result[0] if result and result[0] is not None else 0
 
+    async def _notify_transfer_removal(self, *, fid, old_nickname, alliance_name, old_kid, new_kid):
+        """DM the global admin about an auto-removed state transfer; never raises."""
+        try:
+            self.cursor_settings.execute("SELECT id FROM admin WHERE is_initial = 1")
+            admin_data = self.cursor_settings.fetchone()
+            if not admin_data:
+                return
+            user = await self.bot.fetch_user(admin_data[0])
+            if user:
+                await user.send(
+                    f"{theme.deniedIcon} {old_nickname} `{fid}` was removed from "
+                    f"**{alliance_name}** due to state transfer "
+                    f"(State {old_kid} {theme.forwardIcon} {new_kid})."
+                )
+        except Exception as e:
+            self.logger.warning(f"AllianceSync: could not DM transfer notice for {fid}: {e}")
+
     def get_keep_control_log_setting(self, alliance_id):
         """Get the keep_control_log setting for a specific alliance"""
         self.cursor_alliance.execute("""
@@ -290,7 +307,31 @@ class AllianceSync(commands.Cog):
             self.logger.error(f"Failed to remove invalid ID {fid}: {str(e)}")
             return False, None
 
+    async def _notify_sync_unavailable(self, channel, interaction_message=None):
+        """Alliance sync has no player-data source; tell the admin where to set states instead."""
+        embed = discord.Embed(
+            title=f"{theme.warnIcon} Alliance Sync Unavailable",
+            description=(
+                f"{theme.upperDivider}\n"
+                f"Automatic member sync is turned off - member nicknames, levels and states "
+                f"can no longer be refreshed automatically.\n\n"
+                f"Set member states under **Alliance Management -> Member States**.\n"
+                f"{theme.lowerDivider}"
+            ),
+            color=theme.emColor2,
+        )
+        try:
+            if interaction_message is not None:
+                await interaction_message.edit(embed=embed)
+            elif channel is not None:
+                await channel.send(embed=embed)
+        except Exception:
+            pass
+
     async def check_agslist(self, channel, alliance_id, interaction=None, interaction_message=None, alliance_name=None, is_batch=False, batch_info=None, progress_message=None, process_id=None):
+        await self._notify_sync_unavailable(channel, interaction_message)
+        return
+
         async with self.db_lock:
             self.cursor_users.execute("SELECT fid, nickname, furnace_lv, stove_lv_content, kid FROM users WHERE alliance = ?", (alliance_id,))
             users = self.cursor_users.fetchall()
@@ -505,20 +546,14 @@ class AllianceSync(commands.Cog):
                                     # Remove user from alliance when auto-removal is enabled
                                     self.cursor_users.execute("DELETE FROM users WHERE fid = ?", (fid,))
                                     self.conn_users.commit()
-                                    
+
                                     # Only notify if notifications are enabled for auto-removal
                                     if notify_on_transfer:
-                                        self.cursor_settings.execute("SELECT id FROM admin WHERE is_initial = 1")
-                                        admin_data = self.cursor_settings.fetchone()
-                                        
-                                        if admin_data:
-                                            user = await self.bot.fetch_user(admin_data[0])
-                                            if user:
-                                                await user.send(
-                                                    f"{theme.deniedIcon} {old_nickname} `{fid}` was removed from "
-                                                    f"**{alliance_name}** due to state transfer "
-                                                    f"(State {old_kid} {theme.forwardIcon} {new_kid})."
-                                                )
+                                        await self._notify_transfer_removal(
+                                            fid=fid, old_nickname=old_nickname,
+                                            alliance_name=alliance_name,
+                                            old_kid=old_kid, new_kid=new_kid,
+                                        )
                                 else:
                                     # Just update kid without removing (default behavior)
                                     self.cursor_users.execute("UPDATE users SET kid = ? WHERE fid = ?", (new_kid, fid))
@@ -1022,25 +1057,13 @@ class AllianceSync(commands.Cog):
     @commands.Cog.listener()
     async def on_ready(self):
         if not self.monitor_started:
-            self.logger.info("Starting monitor...")
-
-            # Check API availability
-            await self.login_handler.check_apis_availability()
-            self.logger.info(self.login_handler.get_mode_text(for_console=True))
-
-            # Register handlers with the ProcessQueue cog
+            # Automatic sync is disabled - no player-data API to sync from. Manual
+            # triggers still register so they can report the feature is unavailable.
             process_queue_cog = self.bot.get_cog('ProcessQueue')
             if process_queue_cog:
                 process_queue_cog.register_handler('alliance_sync_manual', self.handle_alliance_sync_manual_process)
                 process_queue_cog.register_handler('alliance_sync', self.handle_alliance_sync_process)
-                self.logger.info("AllianceSync: Registered alliance_sync_manual and alliance_sync handlers with ProcessQueue")
-            else:
-                self.logger.error("AllianceSync: ProcessQueue cog not found, alliance operations will not work")
-
-            self.monitor_alliance_changes.start()
-            await self.start_alliance_checks()
             self.monitor_started = True
-            self.logger.info("Monitor and handlers registered successfully")
 
     async def start_alliance_checks(self):
         try:
@@ -1099,8 +1122,9 @@ class AllianceSync(commands.Cog):
         try:
             async with self.db_lock:
                 self.cursor_alliance.execute("SELECT alliance_id, channel_id, interval, start_time FROM alliancesettings")
+                # NULL interval (row created by a channel-only setup) counts as disabled.
                 current_settings = {
-                    alliance_id: (channel_id, interval, start_time)
+                    alliance_id: (channel_id, interval or 0, start_time)
                     for alliance_id, channel_id, interval, start_time in self.cursor_alliance.fetchall()
                 }
 

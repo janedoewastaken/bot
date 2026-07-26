@@ -226,7 +226,7 @@ class MainMenu(commands.Cog):
                 f"{theme.exportIcon} **Export Members**\n"
                 f"└ Export one alliance or all of them to CSV/TSV\n\n"
                 f"{theme.refreshIcon} **Sync All**\n"
-                f"└ Refresh all alliance data from the game API\n\n"
+                f"└ Unavailable - member data can no longer be refreshed automatically\n\n"
                 f"{theme.editListIcon} **Self-Registration**\n"
                 f"└ Manage the global Self-Registration system\n"
                 f"{theme.lowerDivider}"
@@ -256,7 +256,8 @@ class MainMenu(commands.Cog):
             with sqlite3.connect('db/alliance.sqlite') as db:
                 cursor = db.cursor()
                 cursor.execute(
-                    "SELECT name, kid FROM alliance_list WHERE alliance_id = ?",
+                    "SELECT name, kid, COALESCE(state_locked, 0), COALESCE(multistate, 0) "
+                    "FROM alliance_list WHERE alliance_id = ?",
                     (alliance_id,),
                 )
                 row = cursor.fetchone()
@@ -266,7 +267,7 @@ class MainMenu(commands.Cog):
                     ephemeral=True,
                 )
                 return
-            alliance_name, alliance_kid = row[0], row[1]
+            alliance_name, alliance_kid, state_locked, multistate = row
 
             with sqlite3.connect('db/users.sqlite') as db:
                 cursor = db.cursor()
@@ -288,15 +289,14 @@ class MainMenu(commands.Cog):
             else:
                 stats_line = "_No members yet — use **Add Members** to get started_"
 
-            if alliance_kid is None:
-                state_line = (
-                    f"{theme.globeIcon} **State:** _not locked_ "
-                    f"(players from any state can be added)"
-                )
+            if multistate:
+                state_line = f"{theme.globeIcon} **State:** _multistate_ (members from many states)"
+            elif state_locked and alliance_kid is not None:
+                state_line = f"{theme.globeIcon} **State:** locked to `#{alliance_kid}`"
+            elif alliance_kid is not None:
+                state_line = f"{theme.globeIcon} **State:** `#{alliance_kid}` (home state, not locked)"
             else:
-                state_line = (
-                    f"{theme.globeIcon} **State:** locked to `#{alliance_kid}`"
-                )
+                state_line = f"{theme.globeIcon} **State:** _not set_"
 
             tier = PermissionManager.get_tier(interaction.user.id)
             accessible, _ = PermissionManager.get_admin_alliances(
@@ -325,7 +325,9 @@ class MainMenu(commands.Cog):
                     f"{theme.editListIcon} **Edit Name**\n"
                     f"└ Rename this alliance\n\n"
                     f"{theme.globeIcon} **Set State**\n"
-                    f"└ Lock this alliance to one State (rejects mismatched adds)\n\n"
+                    f"└ Set this alliance's home state (used for redemption and to fill members)\n\n"
+                    f"{theme.lockIcon} **State Lock**\n"
+                    f"└ When on, reject members from other states when adding (needs a home state)\n\n"
                     f"{theme.listIcon} **History**\n"
                     f"└ Furnace level and nickname change history per member\n\n"
                     f"{theme.chartIcon} **Power Rankings**\n"
@@ -339,6 +341,7 @@ class MainMenu(commands.Cog):
 
             view = AllianceHubView(
                 self, alliance_id, alliance_name, tier, alliances_with_counts,
+                state_locked=state_locked, alliance_kid=alliance_kid,
             )
             await safe_edit_message(interaction, embed=embed, view=view, content=None)
 
@@ -408,6 +411,8 @@ class MainMenu(commands.Cog):
                     f"└ API status, DB health, system info, restart, cleanup tools (Global Admin only)\n\n"
                     f"{theme.robotIcon} **Bot Presence**\n"
                     f"└ Set the bot's Discord activity status (Global Admin only)\n\n"
+                    f"{theme.globeIcon} **External OCR Service**\n"
+                    f"└ Set the OCR service URL, or blank for local OCR (Global Admin only)\n\n"
                     f"{theme.supportIcon} **Request Support**\n"
                     f"└ Open a support DM with logs attached\n\n"
                     f"{theme.infoIcon} **About Project**\n"
@@ -765,6 +770,20 @@ class AllianceManagementEntryView(discord.ui.View):
         )
 
     @discord.ui.button(
+        label="Member States",
+        emoji=theme.globeIcon,
+        style=discord.ButtonStyle.primary,
+        custom_id="alliance_entry_member_states",
+        row=3,
+    )
+    async def member_states(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _route_to_cog(
+            interaction, self.cog.bot, "GiftOperations",
+            "show_state_management",
+            missing_label="Gift Codes",
+        )
+
+    @discord.ui.button(
         label="Sync All",
         emoji=theme.refreshIcon,
         style=discord.ButtonStyle.primary,
@@ -799,14 +818,53 @@ class AllianceHubView(discord.ui.View):
     """
 
     def __init__(self, cog, alliance_id: int, alliance_name: str,
-                 tier: str, alliances_with_counts: list):
+                 tier: str, alliances_with_counts: list,
+                 state_locked: bool = False, alliance_kid=None):
         super().__init__(timeout=7200)
         self.cog = cog
         self.alliance_id = alliance_id
         self.alliance_name = alliance_name
         self.tier = tier
         self.alliances = alliances_with_counts  # [(aid, name, count), ...]
+        self.state_locked = bool(state_locked)
+        self.alliance_kid = alliance_kid
         self._build_select()
+        self._build_lock_toggle()
+
+    def _build_lock_toggle(self):
+        # State Lock reads/writes state_locked; label + color reflect the current state.
+        btn = discord.ui.Button(
+            label=f"State Lock: {'On' if self.state_locked else 'Off'}",
+            emoji=theme.lockIcon,
+            style=discord.ButtonStyle.success if self.state_locked else discord.ButtonStyle.secondary,
+            row=2,
+        )
+        btn.callback = self._on_lock_toggle
+        self.add_item(btn)
+
+    async def _on_lock_toggle(self, interaction: discord.Interaction):
+        if self.alliance_kid is None:
+            await interaction.response.send_message(
+                f"{theme.warnIcon} Set a home state first (**Set State**) before locking.",
+                ephemeral=True,
+            )
+            return
+        new_val = 0 if self.state_locked else 1
+        try:
+            with sqlite3.connect('db/alliance.sqlite', timeout=30.0) as conn:
+                conn.execute(
+                    "UPDATE alliance_list SET state_locked = ? WHERE alliance_id = ?",
+                    (new_val, self.alliance_id),
+                )
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Error toggling state lock on alliance {self.alliance_id}: {e}")
+            print(f"Error toggling state lock on alliance {self.alliance_id}: {e}")
+            await interaction.response.send_message(
+                f"{theme.deniedIcon} Failed to update the state lock.", ephemeral=True
+            )
+            return
+        await self.cog.show_alliance_hub(interaction, self.alliance_id)
 
     def _build_select(self):
         # Drop any existing select first (for rebuilds)
@@ -2079,6 +2137,52 @@ class TransferOwnerView(discord.ui.View):
 # Maintenance View
 # ============================================================================
 
+class ExternalOcrModal(discord.ui.Modal):
+    """Set the external OCR service URL. Blank = local OCR on this bot."""
+
+    def __init__(self, cog, is_global: bool):
+        super().__init__(title="External OCR Service")
+        self.cog = cog
+        self.is_global = is_global
+        from .bear_track import remote_ocr_setting, OCR_REMOTE_URL_DEFAULT, OCR_REMOTE_URL_ENV
+        stored = remote_ocr_setting()
+        prefill = stored if stored is not None else (OCR_REMOTE_URL_ENV or OCR_REMOTE_URL_DEFAULT)
+        self.url_input = discord.ui.TextInput(
+            label="OCR Service URL",
+            placeholder="Blank = local OCR. Default is the free shared service.",
+            default=prefill,
+            required=False,
+            max_length=300,
+        )
+        self.add_item(self.url_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # Re-verify the submitter - this writes a bot-wide setting.
+        _, submitter_is_global = PermissionManager.is_admin(interaction.user.id)
+        if not submitter_is_global:
+            await interaction.response.send_message(
+                f"{theme.deniedIcon} Global Admin only.", ephemeral=True)
+            return
+        url = self.url_input.value.strip().rstrip("/")
+        try:
+            from .bear_track import invalidate_remote_ocr_cache
+            with sqlite3.connect("db/settings.sqlite", timeout=30.0) as conn:
+                conn.execute(
+                    "INSERT INTO bot_global_settings (setting_key, setting_value) VALUES (?, ?) "
+                    "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value",
+                    ("remote_ocr_url", url),
+                )
+                conn.commit()
+            invalidate_remote_ocr_cache()
+        except Exception as e:
+            logger.error(f"Failed to save External OCR URL: {e}")
+            print(f"Failed to save External OCR URL: {e}")
+            await interaction.response.send_message(
+                f"{theme.deniedIcon} Could not save the setting.", ephemeral=True)
+            return
+        await self.cog.show_maintenance(interaction)
+
+
 class MaintenanceView(discord.ui.View):
     """Maintenance sub-menu."""
 
@@ -2088,10 +2192,22 @@ class MaintenanceView(discord.ui.View):
         self.is_global = is_global
 
         # Gate Global-Admin-only buttons by stable custom_id, not label text.
-        global_only = {"check_updates", "backup_system", "bot_health", "bot_presence"}
+        global_only = {"check_updates", "backup_system", "bot_health", "bot_presence",
+                       "toggle_remote_ocr"}
         for child in self.children:
             if isinstance(child, discord.ui.Button) and child.custom_id in global_only:
                 child.disabled = not is_global
+
+        # Reflect current External OCR state on its toggle (dynamic label/style).
+        try:
+            from .bear_track import remote_ocr_url
+            ocr_on = remote_ocr_url() is not None
+        except Exception:
+            ocr_on = False
+        for child in self.children:
+            if isinstance(child, discord.ui.Button) and child.custom_id == "toggle_remote_ocr":
+                child.label = f"External OCR Service: {'On' if ocr_on else 'Off'}"
+                child.style = discord.ButtonStyle.success if ocr_on else discord.ButtonStyle.secondary
 
     @discord.ui.button(
         label="Check for Updates",
@@ -2212,11 +2328,27 @@ class MaintenanceView(discord.ui.View):
             print(f"Error loading About menu: {e}")
 
     @discord.ui.button(
+        label="External OCR Service",
+        emoji=theme.globeIcon,
+        style=discord.ButtonStyle.secondary,
+        custom_id="toggle_remote_ocr",
+        row=2
+    )
+    async def toggle_remote_ocr_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Re-verify the clicker: the view is persistent and gated by the opener.
+        _, clicker_is_global = PermissionManager.is_admin(interaction.user.id)
+        if not clicker_is_global:
+            await interaction.response.send_message(
+                f"{theme.deniedIcon} Global Admin only.", ephemeral=True)
+            return
+        await interaction.response.send_modal(ExternalOcrModal(self.cog, clicker_is_global))
+
+    @discord.ui.button(
         label="Main Menu",
         emoji=theme.homeIcon,
         style=discord.ButtonStyle.secondary,
         custom_id="main_menu_from_maintenance",
-        row=2
+        row=3
     )
     async def main_menu_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.cog.show_main_menu(interaction)

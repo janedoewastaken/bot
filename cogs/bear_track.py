@@ -12,6 +12,7 @@ import io
 import re
 import os
 import sqlite3
+import time
 import unicodedata
 import logging
 from dataclasses import dataclass, field
@@ -66,23 +67,61 @@ _LOW_MEM_OCR_PAUSE = 1.0
 
 DEFAULT_OCR_LANG = "en"
 
-# Optional external OCR service. When OCR_REMOTE_URL is set, OCR calls POST the
-# image to that service instead of running a local engine; any remote failure
-# falls back to the local engine for that image. Lets a disk-/RAM-constrained
-# host offload OCR to one shared box. Unset = local OCR, unchanged.
-OCR_REMOTE_URL = os.environ.get("OCR_REMOTE_URL", "").strip().rstrip("/")
-# Shared OCR-engine key, baked in like the gift-code API key so any bot can reach
-# a public instance; sent as X-API-Key. Override via OCR_REMOTE_TOKEN for a
-# private instance (must match that service's OCR_REMOTE_TOKEN).
+# External OCR service. The bot can POST screenshots to a shared OCR box instead
+# of running engines locally (any remote failure falls back to local for that
+# image). The URL resolves as: bot config (UI modal) > OCR_REMOTE_URL env > local.
+# OCR_REMOTE_URL_DEFAULT is the free shared service, offered as the modal's
+# pre-filled suggestion.
+OCR_REMOTE_URL_DEFAULT = "https://ocr.whiteout-bot.com"
+OCR_REMOTE_URL_ENV = os.environ.get("OCR_REMOTE_URL", "").strip().rstrip("/")
+# Shared key (X-API-Key), baked in like the gift-code API key; OCR_REMOTE_TOKEN
+# env overrides it for a private instance.
 OCR_REMOTE_TOKEN = os.environ.get("OCR_REMOTE_TOKEN", "").strip() or "wos_ks_ocr_shared_key"
 try:
     OCR_REMOTE_TIMEOUT = float(os.environ.get("OCR_REMOTE_TIMEOUT", "60"))
 except ValueError:
     OCR_REMOTE_TIMEOUT = 60.0
 
-if OCR_REMOTE_URL:
-    logger.info(f"External OCR mode ON: posting to {OCR_REMOTE_URL} (local fallback on failure).")
-    print(f"[INFO] External OCR mode ON: {OCR_REMOTE_URL}")
+_SETTINGS_DB = "db/settings.sqlite"
+_remote_ocr_cache = (0.0, None)  # (monotonic expiry, URL string | "" | None)
+
+
+def remote_ocr_setting():
+    """Cached UI value for the external OCR URL: a URL string, '' (explicitly
+    disabled), or None (not configured -> defer to env)."""
+    global _remote_ocr_cache
+    now = time.monotonic()
+    exp, val = _remote_ocr_cache
+    if now < exp:
+        return val
+    val = None
+    try:
+        with sqlite3.connect(_SETTINGS_DB, timeout=30.0) as conn:
+            row = conn.execute(
+                "SELECT setting_value FROM bot_global_settings WHERE setting_key=?",
+                ("remote_ocr_url",),
+            ).fetchone()
+            if row:
+                val = row[0]
+    except Exception:
+        val = None
+    _remote_ocr_cache = (now + 10.0, val)
+    return val
+
+
+def remote_ocr_url():
+    """External OCR base URL to use, or None for local OCR.
+    Precedence: bot config (UI modal) > OCR_REMOTE_URL env > local."""
+    val = remote_ocr_setting()
+    if val is not None:
+        return val or None  # '' = disabled (local); otherwise the configured URL
+    return OCR_REMOTE_URL_ENV or None
+
+
+def invalidate_remote_ocr_cache():
+    """Drop the cached value so a UI change takes effect immediately."""
+    global _remote_ocr_cache
+    _remote_ocr_cache = (0.0, None)
 
 if PIL_AVAILABLE:
     try:
@@ -108,6 +147,14 @@ os.makedirs("db", exist_ok=True)
 BEAR_DB_PATH = "db/bear_data.sqlite"
 
 
+def _ensure_bear_hunts_event_time(conn):
+    """Idempotently add the optional event_time column to bear_hunts."""
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(bear_hunts)")]
+    if "event_time" not in cols:
+        conn.execute("ALTER TABLE bear_hunts ADD COLUMN event_time TEXT")
+        conn.commit()
+
+
 def init_bear_database():
     """Initialize bear_hunts + bear_player_damage tables."""
     conn = sqlite3.connect(BEAR_DB_PATH, timeout=30.0)
@@ -125,6 +172,7 @@ def init_bear_database():
             UNIQUE (alliance_id, date, hunting_trap)
         )
     """)
+    _ensure_bear_hunts_event_time(conn)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS bear_player_damage (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -240,6 +288,15 @@ _RALLIES_MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 _BARE_SMALL_INT_RE = re.compile(r'(?<![\d,\.])\b\d{1,3}\b(?![\d,\.])')
+# Ranking-page title, e.g. "Trap 2 Damage Rewards".
+_REWARDS_TRAP_RE = re.compile(r'Trap\s*(\d)\s*Damage', re.IGNORECASE)
+# Alliance tag: exactly 3 alphanumerics in brackets. Fixed in-game, so a name's
+# own brackets won't match.
+_ALLIANCE_TAG_RE = re.compile(r'\[[A-Za-z0-9]{3}\]')
+# Trailing "Damage Points" label (\s* also catches a glued "DamagePoints").
+_ROW_LABEL_SUFFIX_RE = re.compile(r'(?i)\s*(?:damage\s*points|damage|points)\s*:?\s*$')
+# Leading <=3-char tokens (a bracket-less alliance tag or label leak) before a real 4+ char name.
+_LEADING_SHORT_TOKEN_RE = re.compile(r'^(?:\S{1,3}\s+)+(?=\S{4,})')
 _HUNT_DATE_RE = re.compile(r'\b(\d{4})-(\d{2})-(\d{2})')
 _EXPIRES_MARKER_RE = re.compile(
     r'Expire[sd]?|期限|有効期限|만료|تنتهي|Истекает',
@@ -268,12 +325,21 @@ def extract_hunt_date(text: str) -> str | None:
 
 def extract_bear_hunt_stats(text: str):
     """Returns (hunting_trap_str, rallies_str, total_damage_int)."""
+    # Ranking-page title first: won't match a "[Hunting Trap 1]" header.
+    title_match = _REWARDS_TRAP_RE.search(text)
     trap_match = _BRACKETED_TRAP_RE.search(text)
-    if trap_match:
+    if title_match:
+        hunting_trap = title_match.group(1)
+    elif trap_match:
         hunting_trap = trap_match.group(1) or trap_match.group(2)
     else:
         m = _HEADERLESS_TRAP_RE.search(text)
         hunting_trap = m.group(1) if m else ""
+
+    # Ranking pages have no alliance-total/rallies line — don't let max() take
+    # the top player's damage as the total.
+    if len(_ALLIANCE_TAG_RE.findall(text)) >= 3:
+        return hunting_trap, "", 0
 
     # Total damage dwarfs any per-player damage, so max() works.
     number_runs = list(_FORMATTED_NUMBER_RE.finditer(text))
@@ -299,18 +365,31 @@ def extract_bear_hunt_stats(text: str):
 def find_ranking_section_start(text: str):
     """Index where the rank list starts, or None when the image is a
     summary (no rank list to parse — caller must skip row extraction)."""
+    ranking_kw = re.search(r'(?i)\b(?:damage\s+ranking|ranking)\b', text)
+    # Ranking pages carry a tag per row, breaking the "after the last ]"
+    # heuristic. Fallback engines often drop the brackets, so also detect the
+    # page by its "Damage Ranking" title and start at the ranking header.
+    if ranking_kw and (len(_ALLIANCE_TAG_RE.findall(text)) >= 3 or _REWARDS_TRAP_RE.search(text)):
+        return ranking_kw.end()
     last_bracket = text.rfind(']')
     if last_bracket != -1:
         tail = text[last_bracket + 1:]
         if len(_FORMATTED_NUMBER_RE.findall(tail)) >= 3:
             return last_bracket + 1
         return None
-    if _PERSONAL_REWARDS_RE.search(text):
+    # A personal-rewards-only summary has no list; a ranking page shows that tab
+    # label too, so only skip when no ranking list is present.
+    if _PERSONAL_REWARDS_RE.search(text) and not ranking_kw:
         return None
-    m = re.search(r'(?i)\b(?:damage\s+ranking|ranking)\b', text)
-    if m:
-        return m.end()
+    if ranking_kw:
+        return ranking_kw.end()
     return 0
+
+
+def _leading_rank(chunk: str):
+    """The bare 1-2 digit rank badge at the start of a row chunk, or None."""
+    m = re.match(r'\s*(\d{1,2})(?!\d)', chunk)
+    return int(m.group(1)) if m else None
 
 
 def parse_player_rows(text: str, after_pos: int = None):
@@ -334,10 +413,26 @@ def parse_player_rows(text: str, after_pos: int = None):
 
     # Drop the "[Hunting Trap N]" section header from the first chunk.
     chunks[0] = re.sub(r'^.*\][^A-Za-z]*', '', chunks[0], count=1)
-    # Strip the English "Damage Points" suffix from any chunk.
-    _label_suffix_re = re.compile(r'(?i)\s*(?:damage\s+points|damage|points)\s*:?\s*$')
+    # Strip the "Damage Points" suffix; \s* also catches a glued "DamagePoints".
     for i, c in enumerate(chunks):
-        chunks[i] = _label_suffix_re.sub('', c).rstrip()
+        chunks[i] = _ROW_LABEL_SUFFIX_RE.sub('', c).rstrip()
+
+    # Strip the per-row alliance tag so rows aren't dropped by the bracket filter.
+    for i, c in enumerate(chunks):
+        c = _ALLIANCE_TAG_RE.sub(' ', c)
+        # Fallback OCR garbles the ']' into a letter, gluing the 3-char tag onto a
+        # non-Latin name ("[CATI旭東興業"). Strip [ + 3 tag chars + the garbled ].
+        c = re.sub(r'^\s*\[[A-Za-z0-9]{3}[A-Za-z]?(?=[^\x00-\x7F])', '', c)
+        chunks[i] = c
+
+    # Ranking panels pin the viewer's own row at the bottom out of rank order;
+    # drop it when its rank confirms the break (unreadable rank stays).
+    is_ranking = len(_ALLIANCE_TAG_RE.findall(text)) >= 3 or bool(_REWARDS_TRAP_RE.search(text))
+    if is_ranking and len(chunks) >= 2:
+        last_rank, prev_rank = _leading_rank(chunks[-1]), _leading_rank(chunks[-2])
+        if last_rank is not None and prev_rank is not None and last_rank <= prev_rank:
+            chunks.pop()
+            damages.pop()
 
     valid = [i for i, c in enumerate(chunks) if not re.search(r'[.?\[\]]', c)]
     if 0 in valid and len(chunks[0].split()) > 8:
@@ -353,7 +448,11 @@ def parse_player_rows(text: str, after_pos: int = None):
     def _name_token_count(c):
         return sum(1 for t in c.split() if not re.fullmatch(r'\d{1,2}', t))
 
-    if 0 in valid and len(valid) > 1:
+    # On the mail, chunk[0] still carries header words before the first name;
+    # trim leading tokens to match the others. Skip on ranking pages, where the
+    # tag strip already isolated the name (trimming would eat a multi-word name
+    # like "Numb Little Bug" down to its last token).
+    if 0 in valid and len(valid) > 1 and not is_ranking:
         other_counts = [_name_token_count(chunks[i]) for i in valid if i != 0]
         target = max(min(c for c in other_counts if c) if any(other_counts) else 1, 1)
         first_tokens = chunks[0].split()
@@ -372,7 +471,7 @@ def parse_player_rows(text: str, after_pos: int = None):
         name = re.sub(r'\s+', ' ', chunk).strip()
         # Strip leading ≤3-char tokens (label leak from previous row's
         # "Damage Points:") when followed by a real 4+ char name.
-        name = re.sub(r'^(?:\S{1,3}\s+)+(?=\S{4,})', '', name)
+        name = _LEADING_SHORT_TOKEN_RE.sub('', name)
         # Blank when chunk is mostly non-letters (status-bar leak).
         if sum(c.isalpha() for c in name) < 3:
             name = ''
@@ -671,22 +770,22 @@ async def close_remote_ocr_session() -> None:
 async def _remote_ocr_post(path: str, image_bytes: bytes, lang: str):
     """POST an image to the external OCR service. Returns parsed JSON, or None on
     any failure so the caller falls back to the local engine."""
-    url = f"{OCR_REMOTE_URL}{path}"
+    base = remote_ocr_url()
+    if not base:
+        return None
     headers = {"X-API-Key": OCR_REMOTE_TOKEN}
     try:
         form = aiohttp.FormData()
         form.add_field("lang", lang)
         form.add_field("image", image_bytes, filename="image",
                        content_type="application/octet-stream")
-        async with _get_remote_session().post(url, data=form, headers=headers) as resp:
+        async with _get_remote_session().post(f"{base}{path}", data=form, headers=headers) as resp:
             if resp.status != 200:
                 logger.warning(f"External OCR {path} HTTP {resp.status}; using local OCR.")
-                print(f"[WARNING] External OCR {path} HTTP {resp.status}; using local OCR.")
                 return None
             return await resp.json()
     except Exception as e:
         logger.warning(f"External OCR {path} failed ({e}); using local OCR.")
-        print(f"[WARNING] External OCR {path} failed ({e}); using local OCR.")
         return None
 
 
@@ -719,7 +818,7 @@ async def ocr_bytes(image_bytes: bytes, lang: str = DEFAULT_OCR_LANG, *, session
     to a one-shot acquire/release covered by the lifecycle grace period."""
     if not image_bytes:
         return ""
-    if OCR_REMOTE_URL:
+    if remote_ocr_url():
         remote = await _remote_ocr_text(image_bytes, lang)
         if remote is not None:
             return remote
@@ -769,12 +868,87 @@ def _ocr_image_with_engine_boxed(image_bytes, engine) -> list:
     return []
 
 
+def _box_y_bounds(box):
+    """(y_top, y_bottom, y_center, x_left) for a 4-corner box, or None."""
+    try:
+        pts = list(box)
+        if len(pts) < 4:
+            return None
+        ys = [float(p[1]) for p in pts]
+        xs = [float(p[0]) for p in pts]
+    except (TypeError, ValueError, IndexError):
+        return None
+    y_top, y_bottom = min(ys), max(ys)
+    return y_top, y_bottom, (y_top + y_bottom) / 2.0, min(xs)
+
+
+def _boxed_rows(boxed_tokens, y_tol_ratio: float = 0.6):
+    """Cluster [(text, box), ...] into rows by Y. Each row:
+    {'y_center','y_top','y_bottom','tokens':[(text, x_left), ...]}."""
+    items = []
+    heights = []
+    for text, box in boxed_tokens:
+        b = _box_y_bounds(box)
+        if b is None or not str(text).strip():
+            continue
+        y_top, y_bottom, y_center, x_left = b
+        items.append((y_center, y_top, y_bottom, x_left, str(text)))
+        heights.append(y_bottom - y_top)
+    if not items:
+        return []
+    items.sort(key=lambda it: it[0])  # by y_center
+    med_h = sorted(heights)[len(heights) // 2] or 1.0
+    band = med_h * y_tol_ratio
+    rows = []
+    cur = None
+    for y_center, y_top, y_bottom, x_left, text in items:
+        if cur is not None and abs(y_center - cur["y_center"]) <= band:
+            cur["_toks"].append((x_left, text))
+            cur["y_top"] = min(cur["y_top"], y_top)
+            cur["y_bottom"] = max(cur["y_bottom"], y_bottom)
+            # running mean keeps the band centered as tokens accrete
+            cur["y_center"] = (cur["y_top"] + cur["y_bottom"]) / 2.0
+        else:
+            cur = {"y_center": y_center, "y_top": y_top, "y_bottom": y_bottom,
+                   "_toks": [(x_left, text)]}
+            rows.append(cur)
+    for r in rows:
+        r["tokens"] = [(t, x) for x, t in sorted(r.pop("_toks"))]
+    return rows
+
+
+def _y_overlap(a, b) -> float:
+    """Vertical overlap in pixels between two row dicts (0 if disjoint)."""
+    return max(0.0, min(a["y_bottom"], b["y_bottom"]) - max(a["y_top"], b["y_top"]))
+
+
+def _align_rows_by_y(primary_rows, fallback_rows):
+    """Pair each primary row to its best Y-overlapping fallback row (each
+    fallback used once). Returns [(p_row, fb_row|None), ...] in primary order."""
+    used = set()
+    pairs = []
+    for p in primary_rows:
+        best_i, best_ov = None, 0.0
+        for i, f in enumerate(fallback_rows):
+            if i in used:
+                continue
+            ov = _y_overlap(p, f)
+            if ov > best_ov:
+                best_i, best_ov = i, ov
+        if best_i is None:
+            pairs.append((p, None))
+        else:
+            used.add(best_i)
+            pairs.append((p, fallback_rows[best_i]))
+    return pairs
+
+
 async def ocr_bytes_with_boxes(image_bytes: bytes, lang: str = DEFAULT_OCR_LANG,
                                *, session=None) -> list:
     """OCR returning [(text, box), ...]. Box is 4 corner coords. Empty list on failure."""
     if not image_bytes:
         return []
-    if OCR_REMOTE_URL:
+    if remote_ocr_url():
         remote = await _remote_ocr_boxed(image_bytes, lang)
         if remote is not None:
             return remote
@@ -814,7 +988,12 @@ async def ocr_rows_with_fallback(image_bytes: bytes, *, primary_lang: str,
     # pass for the scoreboard) so the primary engine isn't run twice per image.
     if progress_callback and primary_text is None:
         await progress_callback('ocr', primary_lang)
-    text = primary_text if primary_text is not None else await ocr_bytes(image_bytes, lang=primary_lang, session=session)
+    primary_boxed = None
+    if primary_text is not None:
+        text = primary_text
+    else:
+        primary_boxed = await ocr_bytes_with_boxes(image_bytes, lang=primary_lang, session=session)
+        text = ' '.join(t for t, _b in primary_boxed)
     if not text.strip():
         return [], ""
     repaired = repair_ocr_digits(text)
@@ -832,7 +1011,8 @@ async def ocr_rows_with_fallback(image_bytes: bytes, *, primary_lang: str,
         if progress_callback:
             await progress_callback('fallback', fb)
         try:
-            fb_text = await ocr_bytes(image_bytes, lang=fb, session=session)
+            fb_boxed = await ocr_bytes_with_boxes(image_bytes, lang=fb, session=session)
+            fb_text = ' '.join(t for t, _b in fb_boxed)
         except Exception as e:
             logger.warning(f"OCR fallback {fb} failed: {e}")
             continue
@@ -852,7 +1032,7 @@ async def ocr_rows_with_fallback(image_bytes: bytes, *, primary_lang: str,
             for fr in fb_rows:
                 if fr.get("name"):
                     fr["name"] = _reverse_for_rtl(fr["name"], fb)
-        merge(rows, fb_rows, fb_repaired, fb)
+        merge(rows, fb_rows, fb_repaired, fb, primary_boxed=primary_boxed, fb_boxed=fb_boxed)
     return rows, text
 
 
@@ -1065,8 +1245,12 @@ def match_roster(detected_name: str, roster):
         processor=_fold,
         limit=None, score_cutoff=MATCH_LIKELY_MIN,
     )
+    detected_fold = _fold(detected_name)
     for _match_str, score, idx in results:
-        fid, _match_name, penalty, display = _roster_parts(roster[idx])
+        fid, match_name, penalty, display = _roster_parts(roster[idx])
+        # A 1-2 char roster nickname needs exact equality to match
+        if sum(c.isalpha() for c in (match_name or '')) < 3 and _fold(match_name or '') != detected_fold:
+            continue
         adj = int(score) - penalty
         if adj < MATCH_LIKELY_MIN:
             continue
@@ -1237,6 +1421,69 @@ def _collect_claimed_fids(img_rows: dict, roster: list | None) -> set:
             if cands and cands[0][2] >= MATCH_AUTO_CONFIRM:
                 claimed.add(cands[0][0])
     return claimed
+
+
+def _row_name_from_tokens(tokens) -> str:
+    """Join a row's name tokens, dropping the damage number, its label, and any
+    bare number (rank badge or garbled unformatted damage). Keeps OCR noise for
+    later fuzzy resolution."""
+    parts = []
+    for text, _x in tokens:
+        t = text.strip()
+        if not t:
+            continue
+        if _FORMATTED_NUMBER_RE.search(t):        # the damage number (+ glued label)
+            continue
+        if re.fullmatch(r'[\d,\.]+', t):          # bare number: rank badge or garbled damage
+            continue
+        parts.append(t)
+    name = ' '.join(parts)
+    name = _ALLIANCE_TAG_RE.sub(' ', name)        # drop clean [xyz] tag if present
+    name = re.sub(r'\s+', ' ', name).strip()
+    # Match parse_player_rows cleaning: drop the "Damage Points" label and a
+    # bracket-less tag leak, so box-align names resolve as well as parser names.
+    name = _ROW_LABEL_SUFFIX_RE.sub('', name).rstrip()
+    name = _LEADING_SHORT_TOKEN_RE.sub('', name)
+    return name.strip()
+
+
+def _row_damage(tokens):
+    """Parse the row's damage from its tokens, or None."""
+    for text, _x in tokens:
+        m = _FORMATTED_NUMBER_RE.search(text)
+        if m:
+            return int(re.sub(r'[^\d]', '', m.group(0)))
+    return None
+
+
+def merge_fallback_rows_by_boxes(img_rows, primary_boxed, fb_boxed, roster,
+                                 fb_lang: str = "") -> bool:
+    """Geometric merge: align primary rows to fallback rows by Y overlap and
+    fill each unfilled img_rows[damage] with the aligned fallback name. Never
+    uses the fallback's number. Returns True if any row was filled."""
+    p_rows = _boxed_rows(primary_boxed)
+    f_rows = _boxed_rows(fb_boxed)
+    if not p_rows or not f_rows:
+        return False
+    filled = False
+    for p_row, f_row in _align_rows_by_y(p_rows, f_rows):
+        if f_row is None:
+            continue
+        damage = _row_damage(p_row["tokens"])
+        existing = img_rows.get(damage) if damage is not None else None
+        if not existing or not is_row_unfilled(existing, roster):
+            continue
+        name = _row_name_from_tokens(f_row["tokens"])
+        if fb_lang in _RTL_LANGS and name:
+            name = _reverse_for_rtl(name, fb_lang)
+        if not name:
+            continue
+        if name_match_score(name, roster) > name_match_score(existing.get("name") or "", roster):
+            existing["name"] = name
+            filled = True
+            if fb_lang:
+                logger.info(f"Bear OCR box-align [{fb_lang}] filled {name!r} for damage {damage}")
+    return filled
 
 
 def merge_fallback_rows_by_damage(img_rows: dict, fb_rows: list,
@@ -1713,6 +1960,9 @@ class BearSession:
             self.events.append(e)
 
     def save_snapshot(self) -> None:
+        if self.finalized:
+            # In-flight batches must not re-create a deleted snapshot (phantom recovery).
+            return
         from . import ocr_resume
         ocr_resume.save(self._snapshot_key(), 'bear', self.snapshot_payload())
 
@@ -1766,9 +2016,11 @@ class BearSession:
             await self.finalize(timed_out=True)
 
     def stop_timer(self):
-        if self.timer_task and not self.timer_task.done():
-            self.timer_task.cancel()
+        task = self.timer_task
         self.timer_task = None
+        # Never self-cancel: the timeout path runs stop_timer from _timer_run and would kill finalize.
+        if task and not task.done() and task is not asyncio.current_task():
+            task.cancel()
 
     def build_progress_embed(self) -> discord.Embed:
         title = f"{theme.searchIcon} Bear Hunt — collecting"
@@ -1826,10 +2078,25 @@ class BearSession:
                 f"for more screenshots…"
             )
 
+        # Warn when gift-code redemption is running, since it shares the CPU/OCR
+        # and can slow bear OCR to a crawl on smaller hosts.
+        redeem_warning = ""
+        try:
+            pq = self.cog.bot.get_cog('ProcessQueue')
+            if pq and (pq.has_queued_or_active('gift_redeem')
+                       or pq.has_queued_or_active('gift_validate')):
+                redeem_warning = (
+                    f"\n\n{theme.warnIcon} Gift code redemption is running right now, "
+                    f"so bear OCR may be delayed until it finishes."
+                )
+        except Exception:
+            redeem_warning = ""
+
         description = (
             f"{theme.upperDivider}\n"
             f"{summary}"
             f"{status_line}"
+            f"{redeem_warning}"
             f"{footer_line}\n"
             f"{theme.lowerDivider}"
         )
@@ -1926,9 +2193,10 @@ class BearSession:
             self.finalized = True
             self.stop_timer()
             _active_sessions.pop((self.channel_id, self.user_id), None)
-            self.delete_snapshot()
         try:
             await self.cog._finalize_session(self, timed_out=timed_out)
+            # Delete the crash-resume snapshot only on success so a restart can recover after errors.
+            self.delete_snapshot()
         finally:
             await self._release_all_engines()
 
@@ -1955,62 +2223,84 @@ class BearSession:
 _active_sessions: dict = {}
 
 
-class BearSessionView(discord.ui.View):
-    """Done Uploading / Cancel buttons attached to the collecting message."""
+async def _ack_component(interaction: discord.Interaction) -> bool:
+    """Defer a component interaction so the click is acknowledged."""
+    if interaction.response.is_done():
+        return True
+    try:
+        await interaction.response.defer()
+        return True
+    except discord.NotFound:
+        logger.warning("Bear session button: interaction expired before defer")
+        return False
+    except Exception as e:
+        logger.warning(f"Bear session button: defer failed ({e!r})")
+        return False
 
-    def __init__(self, session: BearSession):
-        super().__init__(timeout=None)
-        self.session = session
 
-        done_btn = discord.ui.Button(
-            label="Done Uploading",
-            emoji=f"{theme.verifiedIcon}",
-            style=discord.ButtonStyle.success,
-        )
-        done_btn.callback = self._on_done
+async def _retire_stale_recovery(interaction: discord.Interaction) -> None:
+    """Retire a recovery message whose session is gone so its button isn't left dead."""
+    embed = discord.Embed(
+        description=f"{theme.hourglassIcon} This bear upload recovery has expired — nothing to submit.",
+        color=theme.emColor2,
+    )
+    try:
+        await interaction.response.edit_message(embed=embed, view=None)
+    except Exception:
+        try:
+            await interaction.response.defer()
+        except Exception:
+            pass
 
-        cancel_btn = discord.ui.Button(
-            label="Cancel",
-            emoji=f"{theme.deniedIcon}",
-            style=discord.ButtonStyle.secondary,
-        )
-        cancel_btn.callback = self._on_cancel
 
-        self.add_item(done_btn)
-        self.add_item(cancel_btn)
+class BearSessionButton(discord.ui.DynamicItem[discord.ui.Button],
+                        template=r'bearsess:(?P<action>done|cancel):(?P<channel>[0-9]+):(?P<user>[0-9]+)'):
+    """Done/Cancel button with the session key in its custom_id, so clicks survive a restart."""
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.session.user_id:
+    def __init__(self, action: str, channel_id: int, user_id: int):
+        self.action = action
+        self.channel_id = channel_id
+        self.user_id = user_id
+        if action == 'done':
+            label, emoji, style = "Done Uploading", f"{theme.verifiedIcon}", discord.ButtonStyle.success
+        else:
+            label, emoji, style = "Cancel", f"{theme.deniedIcon}", discord.ButtonStyle.secondary
+        super().__init__(discord.ui.Button(
+            label=label, emoji=emoji, style=style,
+            custom_id=f"bearsess:{action}:{channel_id}:{user_id}",
+        ))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match['action'], int(match['channel']), int(match['user']))
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
             await interaction.response.send_message(
                 f"{theme.deniedIcon} Only the user who started this session can finalize it.",
                 ephemeral=True,
             )
-            return False
-        return True
-
-    async def _on_done(self, interaction: discord.Interaction):
-        if not await self._ack(interaction):
             return
-        asyncio.create_task(self.session.finalize(timed_out=False))
-
-    async def _on_cancel(self, interaction: discord.Interaction):
-        if not await self._ack(interaction):
+        session = _active_sessions.get((self.channel_id, self.user_id))
+        if session is None:
+            await _retire_stale_recovery(interaction)
             return
-        asyncio.create_task(self.session.cancel())
+        if not await _ack_component(interaction):
+            return
+        if self.action == 'done':
+            asyncio.create_task(session.finalize(timed_out=False))
+        else:
+            asyncio.create_task(session.cancel())
 
-    @staticmethod
-    async def _ack(interaction: discord.Interaction) -> bool:
-        if interaction.response.is_done():
-            return True
-        try:
-            await interaction.response.defer()
-            return True
-        except discord.NotFound:
-            logger.warning("Bear session button: interaction expired before defer")
-            return False
-        except Exception as e:
-            logger.warning(f"Bear session button: defer failed ({e!r})")
-            return False
+
+class BearSessionView(discord.ui.View):
+    """Done/Cancel buttons; DynamicItem-based so they keep working after a restart."""
+
+    def __init__(self, session: "BearSession"):
+        super().__init__(timeout=None)
+        self.session = session
+        self.add_item(BearSessionButton('done', session.channel_id, session.user_id))
+        self.add_item(BearSessionButton('cancel', session.channel_id, session.user_id))
 
 
 # ---------------------------------------------------------------------------
@@ -2271,8 +2561,7 @@ _BEAR_INFO_FINGERPRINTS = (
 
 
 def render_bear_info_message() -> str:
-    """The pinned helper text for a bear score channel. Bear is single-event,
-    so the content is static — it just tells members which mail to upload."""
+    """The pinned helper text for a bear score channel — what to upload."""
     return "\n".join([
         f"{theme.importIcon} **Upload your Bear Hunt results here**",
         "",
@@ -2281,11 +2570,14 @@ def render_bear_info_message() -> str:
         "• The **Bear Hunt result mail** — the one headed **\"Battle Overview\"** "
         "with **Rallies** and **Total Alliance Damage**, followed by the "
         "**Damage Ranking** list.",
+        "• The **Damage Ranking** reward pages — to add everyone below the mail's "
+        "top ranks. Open **Bear Trap → Rewards → Damage Ranking**, or "
+        "**Events → Bear Hunt → Damage Rewards → Damage Ranking**.",
         f"{theme.lowerDivider}",
         "",
         f"{theme.infoIcon} **Tips**",
-        "• Live in-trap damage list or personal rewards-only mail won't work.",
-        "• Drop **multiple screenshots** to capture the full ranking",
+        "• Post the **rewards mail plus a few ranking pages** together to capture every participant.",
+        "• We don't track individual rallies, so the individual rally damage list won't work.",
         "• Set your in-game language to **English** for the best results.",
         "• The bot reads each upload automatically and posts the parsed damage here.",
     ])
@@ -2959,7 +3251,8 @@ class BearTrack(commands.Cog):
             await progress_callback('ocr', primary_lang)
         try:
             async with self._acquire_ocr_slot():
-                extracted_text = await ocr_bytes(image_bytes, primary_lang, session=session)
+                primary_boxed = await ocr_bytes_with_boxes(image_bytes, primary_lang, session=session)
+            extracted_text = ' '.join(t for t, _b in primary_boxed)
         except Exception as e:
             logger.error(f"Bear OCR error ({primary_lang}) on {filename}: {e}")
             return result
@@ -3005,7 +3298,8 @@ class BearTrack(commands.Cog):
                     await progress_callback('fallback', fb_lang)
                 try:
                     async with self._acquire_ocr_slot():
-                        fb_text = await ocr_bytes(image_bytes, fb_lang, session=session)
+                        fb_boxed = await ocr_bytes_with_boxes(image_bytes, fb_lang, session=session)
+                    fb_text = ' '.join(t for t, _b in fb_boxed)
                 except Exception as e:
                     logger.warning(f"Bear OCR fallback {fb_lang} failed: {e}")
                     continue
@@ -3032,16 +3326,20 @@ class BearTrack(commands.Cog):
                     continue
                 attempts += 1
                 pre_scores = _score_snapshot()
-                filled_via_damage = False
                 fb_rows = parse_player_rows(fb_repaired)
                 if fb_lang in _RTL_LANGS:
                     for fr in fb_rows:
                         if fr.get('name'):
                             fr['name'] = _reverse_for_rtl(fr['name'], fb_lang)
-                filled_via_damage = merge_fallback_rows_by_damage(
+                filled = merge_fallback_rows_by_damage(
                     img_rows, fb_rows, roster, fb_lang
                 )
-                if not filled_via_damage and fb_lang not in _LATIN_ONLY_LANGS:
+                if not filled:
+                    filled = merge_fallback_rows_by_boxes(
+                        img_rows, primary_boxed, fb_boxed, roster, fb_lang
+                    )
+                # Last resort: text-position anchor, only when cheap-merge and box-align both missed.
+                if not filled and fb_lang not in _LATIN_ONLY_LANGS:
                     fill_unfilled_by_position(
                         img_rows, fb_repaired, fb_lang, filename, roster
                     )
@@ -3095,6 +3393,7 @@ class BearTrack(commands.Cog):
             'rallies': int(primary_event.rallies_value)
                 if primary_event.rallies_value and primary_event.rallies_value.isdigit() else None,
             'total_damage': damage_int or 0,
+            'event_time': None,
         }
         sorted_rows = sorted(
             merged_rows.values(),
@@ -3208,6 +3507,7 @@ class BearTrack(commands.Cog):
             'hunting_trap': int(hunting_trap),
             'rallies': int(rallies) if rallies else None,
             'total_damage': int(total_damage) if total_damage else 0,
+            'event_time': None,
         }
 
         review = BearHuntReviewView(
@@ -3245,6 +3545,17 @@ class BearTrack(commands.Cog):
         if not allowed:
             return
 
+        # Reject bad free-text dates before deferring, or the interaction hangs on "thinking".
+        try:
+            parsed_from = datetime.strptime(from_date, "%Y-%m-%d").date() if from_date else None
+            parsed_to = datetime.strptime(to_date, "%Y-%m-%d").date() if to_date else None
+        except ValueError:
+            await interaction.response.send_message(
+                f"{theme.deniedIcon} Invalid date - use YYYY-MM-DD (e.g. 2026-07-13).",
+                ephemeral=True
+            )
+            return
+
         await interaction.response.defer()
 
         view = BearDamageView(
@@ -3253,8 +3564,8 @@ class BearTrack(commands.Cog):
             original_user_id=interaction.user.id,
             alliance_id=alliance_id,
             hunting_trap=hunting_trap,
-            from_date=datetime.strptime(from_date, "%Y-%m-%d").date() if from_date else None,
-            to_date=datetime.strptime(to_date, "%Y-%m-%d").date() if to_date else None
+            from_date=parsed_from,
+            to_date=parsed_to
         )
 
         embed, file = await self.data_submit.process_view(
@@ -3270,7 +3581,11 @@ class BearTrack(commands.Cog):
             )
             return
 
-        await interaction.followup.send(embed=embed, file=file if file else None, view=view)
+        # file=None is not discord.py's MISSING sentinel and crashes the send.
+        if file:
+            await interaction.followup.send(embed=embed, file=file, view=view)
+        else:
+            await interaction.followup.send(embed=embed, view=view)
 
     @app_commands.command(name="bear_player_history", description="Show a player's bear hunt damage history")
     @app_commands.autocomplete(alliance=alliance_autocomplete,
@@ -3335,9 +3650,11 @@ class BearTrack(commands.Cog):
             alliance_name=alliance_name, fid=fid, nickname=nickname,
             hunting_trap=hunting_trap, rows=rows,
         )
-        await interaction.followup.send(
-            embed=embed, file=image_file if image_file else None
-        )
+        # file=None is not discord.py's MISSING sentinel and crashes the send.
+        if image_file:
+            await interaction.followup.send(embed=embed, file=image_file)
+        else:
+            await interaction.followup.send(embed=embed)
 
     # -------------------------------------------------------------------
     # Main menu entry point
@@ -3725,11 +4042,6 @@ class BearHuntReviewView(discord.ui.View):
             "*Select a player to edit in the drop-down; "
             "clear the name to delete the row.*"
         )
-        parts.append(
-            f"{theme.infoIcon} *Bear mails only list the top ~10 by damage, so only "
-            f"those are auto-recognized for now. Add others with **Add Player** — "
-            f"capturing further participants via OCR is planned in a future release.*"
-        )
         action_lines = [
             f"{theme.addIcon} **Add Player**\n"
             f"└ Add a missed player row manually.",
@@ -3765,10 +4077,13 @@ class BearHuntReviewView(discord.ui.View):
             value=str(self.hunt_meta['rallies']) if self.hunt_meta['rallies'] is not None else "-",
             inline=True,
         )
+        # Time (when set) sits under Date; Total Alliance Damage sits to its right.
+        if self.hunt_meta.get('event_time'):
+            embed.add_field(name="Time (UTC)", value=self.hunt_meta['event_time'], inline=True)
         embed.add_field(
             name="Total Alliance Damage",
             value=format_damage_for_embed(self.hunt_meta['total_damage']) if self.hunt_meta['total_damage'] is not None else "-",
-            inline=False,
+            inline=True,
         )
 
         if not self.rows:
@@ -4257,8 +4572,35 @@ class BearHuntReviewView(discord.ui.View):
         await self.refresh(interaction)
 
 
+def _normalize_event_time(raw):
+    """Blank -> None; a valid H:MM/HH:MM -> zero-padded 'HH:MM'; else ValueError."""
+    s = (raw or "").strip()
+    if not s:
+        return None
+    m = re.fullmatch(r'(\d{1,2}):(\d{2})', s)
+    if not m:
+        raise ValueError("time must be HH:MM")
+    hh, mm = int(m.group(1)), int(m.group(2))
+    if hh > 23 or mm > 59:
+        raise ValueError("time out of range")
+    return f"{hh:02d}:{mm:02d}"
+
+
+def _bear_participants(player_rows):
+    """Matched rows only (fid present) as attendance participants."""
+    out = []
+    for r in (player_rows or []):
+        fid = r.get('fid')
+        if not fid:
+            continue
+        out.append({'fid': fid,
+                    'name': r.get('nickname') or r.get('name') or '',
+                    'damage': int(r['damage'])})
+    return out
+
+
 class EditHeaderModal(discord.ui.Modal):
-    """Edit the hunt-level header fields (date / trap / rallies / total)."""
+    """Edit the hunt-level header fields (date / trap / rallies / total / time)."""
 
     def __init__(self, review_view: BearHuntReviewView):
         super().__init__(title="Edit Bear Hunt Info")
@@ -4282,7 +4624,13 @@ class EditHeaderModal(discord.ui.Modal):
             default=format_damage_for_embed(meta['total_damage']) if meta['total_damage'] else "",
             max_length=30,
         )
-        for item in (self.date_input, self.trap_input, self.rallies_input, self.total_input):
+        self.time_input = discord.ui.TextInput(
+            label="Time (UTC, optional) - HH:MM",
+            default=meta.get('event_time') or "",
+            required=False, max_length=5,
+        )
+        for item in (self.date_input, self.trap_input, self.rallies_input,
+                     self.total_input, self.time_input):
             self.add_item(item)
 
     async def on_submit(self, interaction):
@@ -4310,11 +4658,20 @@ class EditHeaderModal(discord.ui.Modal):
                     f"{theme.deniedIcon} Rallies must be a whole number.", ephemeral=True,
                 )
                 return
+        try:
+            event_time = _normalize_event_time(self.time_input.value)
+        except ValueError:
+            await interaction.response.send_message(
+                f"{theme.deniedIcon} Time must be HH:MM (24-hour UTC), or blank.",
+                ephemeral=True,
+            )
+            return
         self.review_view.hunt_meta = {
             'date': date_norm,
             'hunting_trap': trap,
             'rallies': rallies,
             'total_damage': bear_damage(self.total_input.value),
+            'event_time': event_time,
         }
         await self.review_view.refresh(interaction)
 
@@ -4364,10 +4721,13 @@ class EditRowModal(discord.ui.Modal):
             await interaction.response.send_message(f"{theme.deniedIcon} {err}", ephemeral=True)
             return
         # Shared resolver: roster match, or game-API lookup + add-to-alliance for an unknown ID.
+        edit_row = self.review_view.rows[self.row_idx]
         await _resolve_and_apply(
             interaction, self.review_view, row_id=self.row_idx,
             text=self.player_input.value, damage=damage, rank=rank,
-            raw_name=self.review_view.rows[self.row_idx].get('name'),
+            raw_name=edit_row.get('name'),
+            current_fid=edit_row.get('fid'),
+            current_name=edit_row.get('nickname') or edit_row.get('name'),
         )
 
 
@@ -4407,11 +4767,24 @@ class AddRowModal(discord.ui.Modal):
         )
 
 
-def _resolve_player(text, roster):
+_QUOTE_PAIRS = (('"', '"'), ("'", "'"), ('“', '”'), ('‘', '’'))
+
+
+def _strip_name_quotes(text):
+    """(clean_text, forced_name). Quotes force name-not-ID resolution, so a
+    digit-only username like "517" can be entered as a name."""
+    t = (text or "").strip()
+    for lo, hi in _QUOTE_PAIRS:
+        if len(t) >= 2 and t[0] == lo and t[-1] == hi:
+            return t[1:-1].strip(), True
+    return t, False
+
+
+def _resolve_player(text, roster, force_name=False):
     """Resolve `text` (FID-digits or a name) to (fid, nickname, candidates)
-    against the roster. Returns (None, None, []) if no match.
+    against the roster. `force_name` resolves an all-digit string as a name.
     """
-    if text.isdigit():
+    if text.isdigit() and not force_name:
         fid = int(text)
         # roster entries may be (fid, nick) or (fid, match_name, penalty, display)
         for entry in roster:
@@ -5292,6 +5665,12 @@ class BearDamageEditView(discord.ui.View):
             await interaction.response.send_message(
                 f"{theme.deniedIcon} Failed to delete hunt.", ephemeral=True)
             return
+        try:
+            from .attendance_ocr_parsers import delete_bear_attendance_event
+            delete_bear_attendance_event(hunt_id=self.selected_record_id)
+        except Exception as e:
+            logger.error(f"Bear attendance delete failed: {e}")
+            print(f"[ERROR] Bear attendance delete failed: {e}")
         self.selected_record_id = None
         self.date = self.hunting_trap = self.rallies = self.total_damage = None
         self.players = []
@@ -5580,19 +5959,31 @@ def _fid_in_hunt(view, fid) -> bool:
     return row is not None
 
 
-async def _resolve_and_apply(interaction, view, *, row_id, text, damage, rank, raw_name):
+async def _resolve_and_apply(interaction, view, *, row_id, text, damage, rank, raw_name,
+                             current_fid=None, current_name=None):
     """Resolve `text` (a roster name or an ID) and apply it to the target row.
     Known members match immediately (moving the match off any other row). An
     unknown ID is looked up via the player API and offered for confirmation +
     add-to-alliance. `view` must expose cog, alliance_id, hunt_id, roster,
     original_user_id, and an async refresh()."""
-    text = (text or "").strip()
+    raw = (text or "").strip()
+    # Unchanged edit of a matched row: keep the player, just update damage/rank.
+    if row_id is not None and current_fid is not None and raw == (current_name or "").strip():
+        if _write_match_to_row(view, row_id=row_id, fid=current_fid, nick=current_name,
+                               damage=damage, rank=rank):
+            await view.refresh(interaction)
+        else:
+            await interaction.response.send_message(
+                f"{theme.deniedIcon} Failed to update row.", ephemeral=True)
+        return
+
+    text, forced_name = _strip_name_quotes(raw)
     if not text:
         await interaction.response.send_message(
             f"{theme.deniedIcon} Enter an ID or name.", ephemeral=True)
         return
 
-    if text.isdigit():
+    if text.isdigit() and not forced_name:
         fid = int(text)
         # Adding a brand-new row for someone already in the hunt would orphan
         # their existing row — reject it (editing an existing row swaps instead).
@@ -5627,7 +6018,7 @@ async def _resolve_and_apply(interaction, view, *, row_id, text, damage, rank, r
         return
 
     # Name entered — fuzzy-match the roster only (can't API-lookup by name).
-    fid, nick, _ = _resolve_player(text, view.roster)
+    fid, nick, _ = _resolve_player(text, view.roster, force_name=forced_name)
     if fid is None:
         await interaction.response.send_message(
             f"{theme.deniedIcon} No roster match for `{text}`. Enter the player's **ID** "
@@ -5822,7 +6213,9 @@ class EditSavedPlayerModal(discord.ui.Modal):
         await _resolve_and_apply(
             interaction, self.parent_view, row_id=self.row['id'],
             text=self.player_input.value, damage=damage, rank=rank,
-            raw_name=self.row.get('raw_name'))
+            raw_name=self.row.get('raw_name'),
+            current_fid=self.row.get('fid'),
+            current_name=self.row.get('nickname') or self.row.get('raw_name'))
 
 
 class AddSavedPlayerModal(discord.ui.Modal):
@@ -7032,13 +7425,14 @@ class DataSubmit:
             hunting_trap=hunt_meta['hunting_trap'],
             rallies=hunt_meta.get('rallies'),
             total_damage=hunt_meta.get('total_damage') or 0,
+            event_time=hunt_meta.get('event_time'),
             player_rows=player_rows,
             alliance_id=alliance_id, alliance_name=alliance_name,
             existing_hunt_id=existing_hunt_id,
         )
 
     async def _persist_hunt_and_render(self, interaction, *, date, hunting_trap, rallies,
-                                       total_damage, player_rows=None,
+                                       total_damage, event_time=None, player_rows=None,
                                        alliance_id=None, alliance_name=None,
                                        existing_hunt_id=None):
         """Insert one hunt row (and any provided player rows), then build
@@ -7088,8 +7482,8 @@ class DataSubmit:
                     # Edit in place: keep the hunt record, refresh summary + rows.
                     hunt_id = existing[0]
                     self.bear_cursor.execute(
-                        "UPDATE bear_hunts SET rallies=?, total_damage=? WHERE id=?",
-                        (rallies, total_damage, hunt_id),
+                        "UPDATE bear_hunts SET rallies=?, total_damage=?, event_time=? WHERE id=?",
+                        (rallies, total_damage, event_time, hunt_id),
                     )
                     self.bear_cursor.execute(
                         "DELETE FROM bear_player_damage WHERE hunt_id=?", (hunt_id,)
@@ -7098,9 +7492,9 @@ class DataSubmit:
             if not edited:
                 try:
                     self.bear_cursor.execute(
-                        "INSERT INTO bear_hunts (alliance_id, date, hunting_trap, rallies, total_damage) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        (alliance_id, date, hunting_trap, rallies, total_damage),
+                        "INSERT INTO bear_hunts (alliance_id, date, hunting_trap, rallies, total_damage, event_time) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (alliance_id, date, hunting_trap, rallies, total_damage, event_time),
                     )
                     hunt_id = self.bear_cursor.lastrowid
                 except sqlite3.IntegrityError:
@@ -7144,6 +7538,21 @@ class DataSubmit:
                 learn_alias(alliance_id, name, fid)
             except Exception as e:
                 logger.warning(f"Bear OCR: post-commit learn_alias failed for {name!r}: {e}")
+
+        # Mirror the saved hunt into an attendance event. Best-effort: a sync
+        # failure must never roll back the saved hunt.
+        if player_rows is not None:
+            try:
+                from .attendance_ocr_parsers import sync_bear_attendance_event
+                sync_bear_attendance_event(
+                    alliance_id=alliance_id, hunt_id=hunt_id, date=date,
+                    hunting_trap=hunting_trap, event_time=event_time,
+                    alliance_name=alliance_name,
+                    participants=_bear_participants(player_rows),
+                )
+            except Exception as e:
+                logger.error(f"Bear attendance sync failed for hunt {hunt_id}: {e}")
+                print(f"[ERROR] Bear attendance sync failed for hunt {hunt_id}: {e}")
 
         title_suffix = "Updated Submission" if edited else "Latest Submission"
         if player_rows:
@@ -7231,9 +7640,10 @@ class DataSubmit:
         except discord.NotFound:
             # Original response unavailable (e.g. OCR flow used channel.send).
             try:
-                await interaction.followup.send(
-                    embeds=embeds, file=image_file if image_file else None,
-                )
+                if image_file:
+                    await interaction.followup.send(embeds=embeds, file=image_file)
+                else:
+                    await interaction.followup.send(embeds=embeds)
             except Exception as e:
                 logger.error(f"Failed to send submission result: {e}")
                 print(f"[ERROR] Failed to send submission result: {e}")
@@ -7373,4 +7783,9 @@ class DataSubmit:
 # ---------------------------------------------------------------------------
 
 async def setup(bot):
+    # Route recovery-button clicks after a restart (messages from a prior process).
+    try:
+        bot.add_dynamic_items(BearSessionButton)
+    except Exception as e:
+        logger.warning(f"Bear session: could not register dynamic buttons: {e}")
     await bot.add_cog(BearTrack(bot))

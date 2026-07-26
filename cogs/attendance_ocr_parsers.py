@@ -14,10 +14,12 @@ from typing import Optional
 import discord
 
 from .pimp_my_bot import theme
+from . import alliance_power_changes
 
 logger = logging.getLogger("alliance")
 
-DEFAULT_TIMEOUT_SECONDS = 180
+# 15 min idle before auto-finalize, matching bear_track; admins read counts before deciding.
+DEFAULT_TIMEOUT_SECONDS = 900
 
 
 # ── event registry ────────────────────────────────────────────────────────
@@ -672,7 +674,7 @@ async def ocr_value_rows(image_bytes: bytes, *, roster, alliance_id, session=Non
         fid, _ = fuzzy_match_name(r.get("name") or "", roster, alliance_id=alliance_id)
         return fid is None
 
-    def merge(rows, fb_rows, fb_text, _lang):
+    def merge(rows, fb_rows, fb_text, _lang, *, primary_boxed=None, fb_boxed=None):
         # Cheap value-merge first (works when the fallback engine happens to read
         # the number too). Group by value so rows sharing a value aren't dropped.
         fb_by_value: dict = {}
@@ -687,6 +689,20 @@ async def ocr_value_rows(image_bytes: bytes, *, roster, alliance_id, session=Non
                     if fid is not None:
                         r["name"] = fr["name"]
                         break
+        # Box alignment: pair primary/fallback rows geometrically and fill the
+        # name from the aligned fallback row. Attendance keys by 'value'; the box
+        # merge keys by 'damage', so alias value->damage for the call.
+        if any(is_unfilled(r) for r in rows) and primary_boxed and fb_boxed:
+            by_damage = {}
+            for r in rows:
+                r["damage"] = r["value"]
+                by_damage[r["value"]] = r
+            try:
+                bear_track.merge_fallback_rows_by_boxes(
+                    by_damage, primary_boxed, fb_boxed, roster, _lang)
+            finally:
+                for r in rows:
+                    r.pop("damage", None)
         # Non-Latin engines read names well but mangle numbers, so value-merge
         # usually misses them. Fall back to bear's anchor-based position fill
         # (Latin names from the primary pass anchor the script substrings). It
@@ -1301,6 +1317,28 @@ def assign_unique_fids(raw_rows: list[dict], roster: list[tuple[int, str]],
     return enriched
 
 
+def _rematch_displaced_fids(bucket, keep_idx, fid, lookup_nick):
+    """A manual edit gave row `keep_idx` this `fid`. Re-match every OTHER row in
+    `bucket` that still holds it to its next free candidate, or mark it unmatched,
+    so a duplicate id never silently folds two rows into one on the merged view.
+    Returns [(old_display, new_fid, new_nick), ...] for the rows it moved."""
+    displaced = []
+    for j, row in enumerate(bucket):
+        if j == keep_idx or row.get("fid") != fid:
+            continue
+        old_disp = row.get("nickname") or row.get("name") or "a row"
+        used = {r["fid"] for k, r in enumerate(bucket) if k != j and r.get("fid")}
+        new_fid = new_nick = None
+        new_status = "no_match"
+        for cand_fid, cand_nick, _score, cand_status in (row.get("candidates") or []):
+            if cand_fid not in used:
+                new_fid, new_nick, new_status = cand_fid, (lookup_nick(cand_fid) or cand_nick), cand_status
+                break
+        row["fid"], row["nickname"], row["status"] = new_fid, new_nick, new_status
+        displaced.append((old_disp, new_fid, new_nick))
+    return displaced
+
+
 def fuzzy_match_name(detected: str, roster: list[tuple[int, str]],
                      *, alliance_id: Optional[int] = None) -> tuple[Optional[int], str]:
     """Single-best fuzzy match against the roster as `(fid, status)` — a
@@ -1318,21 +1356,29 @@ def fuzzy_match_name(detected: str, roster: list[tuple[int, str]],
 
 
 def update_users_power(fid: int, power: int, ts_iso: str) -> None:
-    with sqlite3.connect("db/users.sqlite", timeout=30.0) as conn:
+    with sqlite3.connect(_USERS_DB, timeout=30.0) as conn:
+        row = conn.execute("SELECT power FROM users WHERE fid = ?", (fid,)).fetchone()
+        old = row[0] if row else None
         conn.execute(
             "UPDATE users SET power = ?, power_updated_at = ? WHERE fid = ?",
             (power, ts_iso, fid),
         )
         conn.commit()
+    alliance_power_changes.record_change(fid, "power", old, power, ts_iso)
 
 
 def update_users_combat_power(fid: int, combat_power: int, ts_iso: str) -> None:
-    with sqlite3.connect("db/users.sqlite", timeout=30.0) as conn:
+    with sqlite3.connect(_USERS_DB, timeout=30.0) as conn:
+        row = conn.execute(
+            "SELECT combat_power FROM users WHERE fid = ?", (fid,)
+        ).fetchone()
+        old = row[0] if row else None
         conn.execute(
             "UPDATE users SET combat_power = ?, combat_power_updated_at = ? WHERE fid = ?",
             (combat_power, ts_iso, fid),
         )
         conn.commit()
+    alliance_power_changes.record_change(fid, "combat_power", old, combat_power, ts_iso)
 
 
 def update_users_labyrinth_stages(fid: int, stages: int, ts_iso: str) -> None:
@@ -1348,6 +1394,7 @@ def update_users_labyrinth_stages(fid: int, stages: int, ts_iso: str) -> None:
 # ── attendance session DB helpers ─────────────────────────────────────────
 
 _ATT_DB = "db/attendance.sqlite"
+_USERS_DB = "db/users.sqlite"
 
 
 def _init_labyrinth_snapshot_tables() -> None:
@@ -1877,6 +1924,53 @@ def delete_session(session_id: str) -> None:
         conn.commit()
 
 
+def _bear_session_id(hunt_id) -> str:
+    return f"bear-{hunt_id}"
+
+
+def _bear_trap_label(hunting_trap) -> str:
+    return {1: "Trap 1", 2: "Trap 2", 3: "Both Traps"}.get(
+        int(hunting_trap), f"Trap {hunting_trap}")
+
+
+def sync_bear_attendance_event(*, alliance_id, hunt_id, date, hunting_trap,
+                               event_time, alliance_name, participants) -> None:
+    """Create or replace the attendance event mirroring one bear hunt. Bear is
+    the source of truth: the event's records are fully rewritten to the current
+    participants (all 'present', points=damage). event_time may be None."""
+    session_id = _bear_session_id(hunt_id)
+    trap_label = _bear_trap_label(hunting_trap)
+    session_name = f"{trap_label} - {date}"
+    with sqlite3.connect(_ATT_DB, timeout=30.0) as conn:
+        conn.execute("DELETE FROM attendance_records WHERE session_id = ?", (session_id,))
+        conn.execute(
+            "INSERT OR REPLACE INTO attendance_sessions "
+            "(session_id, event_type, event_date, event_subtype, alliance_id, "
+            " awaiting_result, origin, event_time) "
+            "VALUES (?, 'bear', ?, ?, ?, 0, 'bear', ?)",
+            (session_id, date, trap_label, alliance_id, event_time),
+        )
+        for p in participants:
+            conn.execute(
+                "INSERT INTO attendance_records "
+                "(session_id, session_name, event_type, event_date, player_id, "
+                " player_name, alliance_id, alliance_name, status, points, event_subtype) "
+                "VALUES (?, ?, 'bear', ?, ?, ?, ?, ?, 'present', ?, ?)",
+                (session_id, session_name, date, str(p['fid']), p['name'],
+                 str(alliance_id), alliance_name or "", int(p['damage']), trap_label),
+            )
+        conn.commit()
+
+
+def delete_bear_attendance_event(*, hunt_id) -> None:
+    """Remove the attendance event mirroring a deleted bear hunt."""
+    session_id = _bear_session_id(hunt_id)
+    with sqlite3.connect(_ATT_DB, timeout=30.0) as conn:
+        conn.execute("DELETE FROM attendance_records WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM attendance_sessions WHERE session_id = ?", (session_id,))
+        conn.commit()
+
+
 def _unmatched_id_floor(session_id: str) -> int:
     """Most-negative existing player_id for this session, or 0 if none. Callers
     decrement from this to allocate a fresh per-session placeholder id."""
@@ -1987,25 +2081,35 @@ class OcrUploadSession:
                 self._pending_interaction = None
             return
         self.finalized = True
-        self.delete_snapshot()
         self.stop_timer()
         try:
             # Wait for any in-flight batch so we render the full parsed set, not a
             # partial one (e.g. Done clicked while a second batch is still OCRing).
             async with self._lock:
                 await self.render_review(timed_out=timed_out)
+            # Delete the crash-resume snapshot only on success so a restart can recover after errors.
+            self.delete_snapshot()
         except Exception:
             logger.exception("OcrUploadSession: failed to render review")
-            pending = self._pending_interaction
-            if pending is not None and pending.response.is_done():
-                try:
-                    await pending.followup.send(
-                        f"{theme.deniedIcon} Couldn't open the review screen — try again.",
-                        ephemeral=True,
-                    )
-                except (discord.NotFound, discord.HTTPException):
-                    pass
-                self._pending_interaction = None
+            # Reopen so Done can be retried instead of stranding the upload behind a dead button.
+            self.finalized = False
+            await self._render_review_failed()
+
+    async def _render_review_failed(self) -> None:
+        """Hand the buttons back after a failed review build, with a visible why."""
+        if self.progress_message is None:
+            return
+        embed = self.build_progress_embed()
+        embed.add_field(
+            name=f"{theme.warnIcon} Could not build the review",
+            value=("Something went wrong assembling the review. Click **Done Uploading** "
+                   "to try again, or re-upload the screenshots."),
+            inline=False,
+        )
+        try:
+            await self.progress_message.edit(embed=embed, view=_ProgressView(self))
+        except (discord.NotFound, discord.HTTPException):
+            pass
 
     async def cancel(self, *, by_user: bool = False):
         if self.finalized or self.cancelled:
@@ -2027,9 +2131,11 @@ class OcrUploadSession:
         self._timer_task = asyncio.create_task(self._timer_run())
 
     def stop_timer(self):
-        if self._timer_task and not self._timer_task.done():
-            self._timer_task.cancel()
+        task = self._timer_task
         self._timer_task = None
+        # Never self-cancel: the timeout path runs stop_timer from _timer_run and would kill finalize.
+        if task and not task.done() and task is not asyncio.current_task():
+            task.cancel()
 
     async def _timer_run(self):
         try:
@@ -2114,6 +2220,9 @@ class OcrUploadSession:
         import datetime as _dt
         import json as _json
         p: dict = {'channel_id': self.channel.id}
+        # Kept so resume() can revive the original message instead of posting a duplicate.
+        if self.progress_message is not None:
+            p['progress_message_id'] = self.progress_message.id
         for k, v in self.__dict__.items():
             if k in self._SNAPSHOT_SKIP:
                 continue
@@ -2143,6 +2252,9 @@ class OcrUploadSession:
             setattr(self, k, v)
 
     def save_snapshot(self) -> None:
+        if self.finalized or self.cancelled:
+            # In-flight batches must not re-create a deleted snapshot (phantom recovery).
+            return
         from . import ocr_resume
         ocr_resume.save(self._snapshot_key(), 'attendance', self.snapshot_payload())
 
@@ -2165,7 +2277,18 @@ class OcrUploadSession:
             ),
             color=theme.emColor1,
         )
-        self.progress_message = await self.channel.send(embed=embed, view=_ProgressView(self))
+        view = _ProgressView(self)
+        msg_id = getattr(self, 'progress_message_id', None)
+        if msg_id:
+            try:
+                msg = await self.channel.fetch_message(msg_id)
+                await msg.edit(embed=embed, view=view)
+                self.progress_message = msg
+                self.restart_timer()
+                return
+            except (discord.NotFound, discord.HTTPException):
+                pass
+        self.progress_message = await self.channel.send(embed=embed, view=view)
         self.restart_timer()
 
     def extra_progress_lines(self) -> str:
