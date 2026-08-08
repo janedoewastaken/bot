@@ -70,12 +70,12 @@ def check_mention_placeholder_misuse(text: str, is_embed: bool = False) -> str |
         if is_embed:
             return (
                 f"{theme.warnIcon} You typed `{examples}` but mentions don't work inside embeds.\n"
-                f"Use `{{tag}}` instead - it will add the mention above the embed."
+                f"Use `{{tag}}` instead. It will add the mention above the embed."
             )
         else:
             return (
                 f"{theme.warnIcon} You typed `{examples}` but this won't ping anyone.\n"
-                f"Use `{{tag}}` instead - it will be replaced with your configured mention."
+                f"Use `{{tag}}` instead. It will be replaced with your configured mention."
             )
     return None
 
@@ -137,7 +137,7 @@ class QuarantinedNotificationActionView(discord.ui.View):
             return
         msg = (f"{theme.verifiedIcon} Re-enabled **{affected}** notification(s)."
                if affected else
-               f"{theme.infoIcon} Already resolved — nothing matched.")
+               f"{theme.infoIcon} Already resolved. Nothing matched.")
         await interaction.response.edit_message(content=msg, embed=None, view=None)
 
     async def _on_delete(self, interaction: discord.Interaction):
@@ -159,7 +159,7 @@ class QuarantinedNotificationActionView(discord.ui.View):
             return
         msg = (f"{theme.verifiedIcon} Permanently deleted **{affected}** notification(s)."
                if affected else
-               f"{theme.infoIcon} Already resolved — nothing matched.")
+               f"{theme.infoIcon} Already resolved. Nothing matched.")
         await interaction.response.edit_message(content=msg, embed=None, view=None)
 
 
@@ -624,7 +624,7 @@ class NotificationSystem(commands.Cog):
 
             # If start_date is provided, use it as the base date (for wizard updates)
             if start_date:
-                next_notification = start_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                next_notification = tz.localize(start_date.replace(hour=hour, minute=minute, second=0, microsecond=0, tzinfo=None))
             else:
                 # Fall back to existing behavior: keep current date, update time only
                 self.cursor.execute("SELECT next_notification FROM bear_notifications WHERE id = ?", (notification_id,))
@@ -2025,7 +2025,7 @@ class EmbedEditorView(discord.ui.View):
             # Sample values for preview - use actual event data when available
             example_time = "30 minutes"
             example_name = self.event_type if self.event_type else "Bear Trap"
-            example_emoji = get_event_icon(self.event_type) if self.event_type else "🐻"
+            example_emoji = get_event_icon(self.event_type) if self.event_type else f"{theme.bearTrapIcon}"
             example_event_time = f"{self.hour:02d}:{self.minute:02d}"
             example_date = self.start_date.strftime("%b %d") if self.start_date else "Dec 06"
 
@@ -2448,7 +2448,7 @@ class EventTypeSelectView(discord.ui.View):
             # Sample values for preview
             example_time = "30 minutes"
             example_name = self.selected_event_type if self.selected_event_type else "Event"
-            example_emoji = get_event_icon(self.selected_event_type) if self.selected_event_type else "📅"
+            example_emoji = get_event_icon(self.selected_event_type) if self.selected_event_type else f"{theme.calendarIcon}"
             example_event_time = f"{self.hour:02d}:{self.minute:02d}"
             example_date = self.start_date.strftime("%b %d") if self.start_date else "Dec 06"
 
@@ -3564,7 +3564,7 @@ class BearTrapView(discord.ui.View):
 
                     class PreviewButton(discord.ui.Button):
                         def __init__(self, cog, notification_id):
-                            super().__init__(label="👀 Preview", style=discord.ButtonStyle.primary)
+                            super().__init__(label=f"{theme.eyesIcon} Preview", style=discord.ButtonStyle.primary)
                             self.cog = cog
                             self.notification_id = notification_id
 
@@ -3586,7 +3586,7 @@ class BearTrapView(discord.ui.View):
                                 # Sample values for preview variable replacement
                                 example_time = "30 minutes"
                                 example_name = event_type if event_type else "Event"
-                                example_emoji = get_event_icon(event_type) if event_type else "📅"
+                                example_emoji = get_event_icon(event_type) if event_type else f"{theme.calendarIcon}"
                                 example_event_time = f"{hours:02d}:{minutes:02d}"
                                 try:
                                     next_dt = datetime.fromisoformat(next_notification.replace("+00:00", ""))
@@ -3697,7 +3697,7 @@ class BearTrapView(discord.ui.View):
 
                     class ShowCodeButton(discord.ui.Button):
                         def __init__(self, embed_json):
-                            super().__init__(label="💾 Show Code", style=discord.ButtonStyle.secondary)
+                            super().__init__(label=f"{theme.saveIcon} Show Code", style=discord.ButtonStyle.secondary)
                             self.embed_json = embed_json
 
                         async def callback(self, interaction: discord.Interaction):
@@ -3708,7 +3708,7 @@ class BearTrapView(discord.ui.View):
 
                     class AdvancedSettingsButton(discord.ui.Button):
                         def __init__(self, cog, notification_id):
-                            super().__init__(label="🧹 Message Cleanup", style=discord.ButtonStyle.secondary)
+                            super().__init__(label=f"{theme.cleanIcon} Message Cleanup", style=discord.ButtonStyle.secondary)
                             self.cog = cog
                             self.notification_id = notification_id
 

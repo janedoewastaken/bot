@@ -4,11 +4,13 @@ from discord.ext import commands
 import sqlite3
 import asyncio
 import logging
+from contextlib import closing
 from datetime import datetime, timezone
 from .pimp_my_bot import theme
-from .login_handler import LoginHandler
 from .alliance import check_alliance_state
-from .gift_state_resolver import verify_add_state
+from .gift_state_resolver import verify_add_state, get_alliance_kid
+from .bot_level_mapping import parse_furnace_level, parse_state
+from .alliance_member_edit import apply_member_edit
 
 logger = logging.getLogger('alliance')
 
@@ -78,22 +80,19 @@ class AllianceRegistration(commands.Cog):
     def is_registration_enabled(self) -> bool:
         """Check if registration is enabled in the settings database."""
         try:
-            conn = sqlite3.connect("db/settings.sqlite")
-            cursor = conn.cursor()
+            with closing(sqlite3.connect("db/settings.sqlite")) as conn:
+                cursor = conn.cursor()
 
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='register_settings'")
-            table_exists = cursor.fetchone()
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='register_settings'")
+                table_exists = cursor.fetchone()
 
-            if not table_exists:
-                conn.close()
-                return False
+                if not table_exists:
+                    return False
 
-            cursor.execute("SELECT enabled FROM register_settings WHERE rowid = 1")
-            result = cursor.fetchone()
+                cursor.execute("SELECT enabled FROM register_settings WHERE rowid = 1")
+                result = cursor.fetchone()
 
-            conn.close()
-
-            return bool(result[0]) if result else False
+                return bool(result[0]) if result else False
 
         except Exception as e:
             logger.error(f"Error checking registration status: {e}")
@@ -110,18 +109,6 @@ class AllianceRegistration(commands.Cog):
             discord.app_commands.Choice(name=name, value=alliance_id)
             for alliance_id, name in alliances if current.lower() in name.lower()
         ][:25]
-
-    async def fetch_user(self, fid: int):
-        result = await LoginHandler().fetch_player_data(str(fid))
-
-        if result['status'] == 'success':
-            return {"msg": "success", "data": result['data']}
-        elif result['status'] == 'rate_limited':
-            raise Exception("RATE_LIMITED")
-        elif result['status'] == 'not_found':
-            return {"msg": "role not exist"}
-        else:
-            raise Exception(result.get('error_message', 'Failed to fetch user data'))
 
     def _alliance_exists(self, alliance_id: int) -> bool:
         with sqlite3.connect("db/alliance.sqlite", timeout=30.0) as conn:
@@ -174,17 +161,31 @@ class AllianceRegistration(commands.Cog):
     )
     @discord.app_commands.describe(
         fid="Your In-Game ID",
-        alliance="Your Alliance Name"
+        alliance="Your Alliance Name",
+        state="Your state number. Only needed if your alliance spans several states",
+        name="Your in-game name",
+        level="Your furnace level, like 30 or FC 10",
     )
     @discord.app_commands.rename(fid="id")
     @discord.app_commands.autocomplete(alliance=alliance_autocomplete)
-    async def register(self, interaction: discord.Interaction, fid: int, alliance: int):
+    async def register(self, interaction: discord.Interaction, fid: int, alliance: int,
+                       state: "int | None" = None, name: "str | None" = None,
+                       level: "str | None" = None):
         if not self.is_registration_enabled():
             await interaction.response.send_message(
                 f"{theme.deniedIcon} Registration is currently disabled.",
                 ephemeral=True
             )
             return
+
+        furnace_lv = None
+        if level is not None:
+            furnace_lv = parse_furnace_level(level)
+            if furnace_lv is None:
+                await interaction.response.send_message(
+                    f"{theme.deniedIcon} `{level}` isn't a furnace level. "
+                    f"Try something like `30` or `FC 10`.", ephemeral=True)
+                return
 
         caller_id = interaction.user.id
         current_server_id = interaction.guild_id if interaction.guild else None
@@ -210,9 +211,13 @@ class AllianceRegistration(commands.Cog):
         if existing and existing[1] == caller_id:
             existing_server_id = existing[2]
             if existing_server_id == current_server_id:
+                changed = []
+                if name or furnace_lv:
+                    changed = await asyncio.to_thread(apply_member_edit, fid,
+                                                      nickname=name, furnace_lv=furnace_lv)
+                note = f"Updated your {' and '.join(changed)}." if changed else "Nothing to change."
                 await interaction.response.send_message(
-                    f"{theme.verifiedIcon} ID `{fid}` is already registered to you here. "
-                    f"Nothing to change.",
+                    f"{theme.verifiedIcon} ID `{fid}` is already registered to you here. {note}",
                     ephemeral=True,
                 )
                 return
@@ -231,23 +236,38 @@ class AllianceRegistration(commands.Cog):
 
         if existing:
             self._attach_discord_to_existing(fid, caller_id, current_server_id)
+            if name or furnace_lv:
+                await asyncio.to_thread(apply_member_edit, fid,
+                                        nickname=name, furnace_lv=furnace_lv)
             await self._send_register_success(interaction, fid, caller_id, action="linked")
             return
 
         # Resolve state with one probe; defer first since it's slow.
         await interaction.response.defer(ephemeral=True)
-        gift_cog = self.bot.get_cog("GiftOperations")
-        if gift_cog is not None:
-            kid, verified = await verify_add_state(gift_cog, fid, alliance)
+        if state is not None:
+            kid = parse_state(state)
+            if kid is None:
+                await interaction.followup.send(
+                    f"{theme.deniedIcon} `{state}` isn't a state number. "
+                    f"Enter digits only, like `911`.", ephemeral=True)
+                return
         else:
-            kid, verified = None, False
+            gift_cog = self.bot.get_cog("GiftOperations")
+            kid = (await verify_add_state(gift_cog, fid, alliance))[0] if gift_cog else None
+            # No home state to inherit or confirm against, so we can't work it out.
+            if kid is None and await asyncio.to_thread(get_alliance_kid, alliance) is None:
+                await interaction.followup.send(
+                    f"{theme.infoIcon} This alliance has members in several states, so "
+                    f"we can't tell which one you're in. Run `/register` again and fill in "
+                    f"the **state** option with your state number.", ephemeral=True)
+                return
 
         state_error = check_alliance_state(alliance, kid)
         if state_error:
             await interaction.followup.send(f"{theme.deniedIcon} {state_error}", ephemeral=True)
             return
 
-        user_data = {"nickname": f"Player {fid}", "stove_lv": 0, "kid": kid}
+        user_data = {"nickname": name or f"Player {fid}", "stove_lv": furnace_lv or 0, "kid": kid}
         self._insert_new_user(fid, user_data, alliance, caller_id, current_server_id)
         await self._send_register_success(interaction, fid, caller_id, action="registered")
 

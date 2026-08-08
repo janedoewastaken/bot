@@ -10,7 +10,6 @@ import logging
 import re
 from datetime import datetime
 from .pimp_my_bot import theme
-from .login_handler import LoginHandler
 
 logger = logging.getLogger('bot')
 
@@ -52,10 +51,9 @@ class ChannelSelect(discord.ui.ChannelSelect):
         selected_channel = self.values[0]
         channel_id = selected_channel.id
 
+        svs_conn = sqlite3.connect("db/svs.sqlite")
+        svs_cursor = svs_conn.cursor()
         try:
-            svs_conn = sqlite3.connect("db/svs.sqlite")
-            svs_cursor = svs_conn.cursor()
-            
             # Check if we're updating a minister channel
             if self.context.endswith("channel"):
                 # Get the activity name from the context (e.g., "Construction Day channel" -> "Construction Day")
@@ -104,8 +102,6 @@ class ChannelSelect(discord.ui.ChannelSelect):
                     minister_menu_cog = self.bot.get_cog("MinisterMenu")
                     if minister_menu_cog:
                         await minister_menu_cog.update_channel_message(activity_name)
-            
-            svs_conn.close()
 
             # Check if this is being called from the minister menu system
             minister_menu_cog = self.bot.get_cog("MinisterMenu")
@@ -158,6 +154,8 @@ class ChannelSelect(discord.ui.ChannelSelect):
                     f"{theme.deniedIcon} Failed to update:\n```{e}```",
                     ephemeral=True
                 )
+        finally:
+            svs_conn.close()
 
 class MinisterSchedule(commands.Cog):
     def __init__(self, bot):
@@ -216,17 +214,6 @@ class MinisterSchedule(commands.Cog):
             self.svs_conn.close()
         except Exception:
             pass
-
-    async def fetch_user_data(self, fid, proxy=None):
-        result = await LoginHandler().fetch_player_data(str(fid), use_proxy=proxy)
-        if result['status'] == 'success':
-            return {"data": result['data']}
-        elif result['status'] == 'rate_limited':
-            return 429
-        elif result['status'] == 'not_found':
-            return {"data": None}
-        else:
-            return None
 
     async def send_embed_to_channel(self, embed):
         """Sends the embed message to a specific channel."""
@@ -498,75 +485,7 @@ class MinisterSchedule(commands.Cog):
             print(f"Error in all_or_available autocomplete: {e}")
             return []
 
-    # handler for looping through all times and updating fids to current nickname
-    async def update_time_list(self, booked_times, progress_callback=None):
-        """
-        Generates a list of time slots with their booking details, fetching nicknames from the API.
-        Implements rate limit handling and batch processing.
-        """
-        time_list = []
-        booked_fids = {}
-
-        fids_to_fetch = {fid for fid, _ in booked_times.values() if fid}
-        fetched_data = {}  # Cache API responses
-
-        # Get current slot mode
-        self.svs_cursor.execute("SELECT context_id FROM reference WHERE context=?", ("slot_mode",))
-        row = self.svs_cursor.fetchone()
-        slot_mode = int(row[0]) if row else 0
-
-        # Generate time slots based on mode
-        time_slots = self.get_time_slots(slot_mode)
-
-        for time_slot in time_slots:
-            booked_fid, booked_alliance = booked_times.get(time_slot, ("", ""))
-
-            booked_nickname = "Unknown"
-            if booked_fid:
-                # Check cache first
-                if booked_fid not in fetched_data:
-                    while True:
-                        if progress_callback:
-                            await progress_callback(len(fetched_data), len(fids_to_fetch), waiting=False)
-
-                        data = await self.fetch_user_data(booked_fid)
-                        # data can be {"data": None} for a deleted game account.
-                        if isinstance(data, dict) and data.get("data"):
-                            fetched_data[booked_fid] = data["data"].get("nickname", "Unknown")
-                            if progress_callback: # Immediate progress update after successful fetch
-                                await progress_callback(len(fetched_data), len(fids_to_fetch), waiting=False)
-                            break
-                        elif data == 429:
-                            if progress_callback:
-                                await progress_callback(len(fetched_data), len(fids_to_fetch), waiting=True)
-                            await asyncio.sleep(60) # Rate limit, wait and retry
-                        else:
-                            fetched_data[booked_fid] = "Unknown"
-                            if progress_callback: # Immediate progress update even for failed fetch
-                                await progress_callback(len(fetched_data), len(fids_to_fetch), waiting=False)
-                            break
-
-                booked_nickname = fetched_data.get(booked_fid, "Unknown")
-
-                # Fetch alliance name
-                self.alliance_cursor.execute("SELECT name FROM alliance_list WHERE alliance_id=?", (booked_alliance,))
-                alliance_data = self.alliance_cursor.fetchone()
-                booked_alliance_name = alliance_data[0] if alliance_data else "Unknown"
-
-                # Wrap nickname in LTR embedding to prevent line reversal
-                time_list.append(f"`{time_slot}` - [{booked_alliance_name}]\u202a{booked_nickname}\u202c - {booked_fid}")
-            else:
-                time_list.append(f"`{time_slot}` - ")
-
-            booked_fids[time_slot] = booked_fid
-
-            # Update progress after processing each time slot
-            if progress_callback:
-                await progress_callback(len(fetched_data), len(fids_to_fetch), waiting=False)
-
-        return time_list, booked_fids
-
-    # handler for looping through all times without updating fids
+    # handler for looping through all times, reading current nicknames from the database
     def generate_time_list(self, booked_times):
         """
         Generates a list of time slots with their booking details.
@@ -897,19 +816,7 @@ class MinisterSchedule(commands.Cog):
             )
 
             # Try to get the avatar image
-            try:
-                data = await self.fetch_user_data(fid)
-
-                if isinstance(data, int) and data == 429:
-                    # Rate limit hit
-                    avatar_image = "https://gof-formal-avatar.akamaized.net/avatar-dev/2023/07/17/1001.png"
-                elif data and "data" in data and "avatar_image" in data["data"]:
-                    avatar_image = data["data"]["avatar_image"]
-                else:
-                    avatar_image = "https://gof-formal-avatar.akamaized.net/avatar-dev/2023/07/17/1001.png"
-
-            except Exception as e:
-                avatar_image = "https://gof-formal-avatar.akamaized.net/avatar-dev/2023/07/17/1001.png"
+            avatar_image = "https://gof-formal-avatar.akamaized.net/avatar-dev/2023/07/17/1001.png"
 
             # Send embed confirmation to log channel
             embed = discord.Embed(
@@ -918,7 +825,7 @@ class MinisterSchedule(commands.Cog):
                 color=theme.emColor3
             )
             embed.set_thumbnail(url=avatar_image)
-            embed.set_author(name=f"Added by {interaction.user.display_name}", icon_url=interaction.user.avatar.url)
+            embed.set_author(name=f"Added by {interaction.user.display_name}", icon_url=interaction.user.avatar.url if interaction.user.avatar else None)
 
             await self.send_embed_to_channel(embed)
             await interaction.followup.send(f"Added {nickname} to {time}")
@@ -1049,19 +956,7 @@ class MinisterSchedule(commands.Cog):
             )
 
             # Try to get the avatar image
-            try:
-                data = await self.fetch_user_data(fid)
-
-                if isinstance(data, int) and data == 429:
-                    # Rate limit hit
-                    avatar_image = "https://gof-formal-avatar.akamaized.net/avatar-dev/2023/07/17/1001.png"
-                elif data and "data" in data and "avatar_image" in data["data"]:
-                    avatar_image = data["data"]["avatar_image"]
-                else:
-                    avatar_image = "https://gof-formal-avatar.akamaized.net/avatar-dev/2023/07/17/1001.png"
-
-            except Exception as e:
-                avatar_image = "https://gof-formal-avatar.akamaized.net/avatar-dev/2023/07/17/1001.png"
+            avatar_image = "https://gof-formal-avatar.akamaized.net/avatar-dev/2023/07/17/1001.png"
 
             # Send embed confirmation to log channel
             embed = discord.Embed(
@@ -1070,7 +965,7 @@ class MinisterSchedule(commands.Cog):
                 color=theme.emColor2
             )
             embed.set_thumbnail(url=avatar_image)
-            embed.set_author(name=f"Removed by {interaction.user.display_name}", icon_url=interaction.user.avatar.url)
+            embed.set_author(name=f"Removed by {interaction.user.display_name}", icon_url=interaction.user.avatar.url if interaction.user.avatar else None)
 
             await self.send_embed_to_channel(embed)
             await interaction.followup.send(f"Removed {nickname}")
@@ -1196,7 +1091,7 @@ class MinisterSchedule(commands.Cog):
                         description=f"All appointments for {appointment_type} have been successfully removed.",
                         color=theme.emColor2
                     )
-                    embed.set_author(name=f"Cleared by {interaction.user.display_name}", icon_url=interaction.user.avatar.url)
+                    embed.set_author(name=f"Cleared by {interaction.user.display_name}", icon_url=interaction.user.avatar.url if interaction.user.avatar else None)
 
                     await self.send_embed_to_channel(embed)
                     await interaction.followup.send(f"{theme.verifiedIcon} Deleted all {appointment_type} appointments.")
@@ -1216,10 +1111,9 @@ class MinisterSchedule(commands.Cog):
     @app_commands.autocomplete(appointment_type=appointment_autocomplete, all_or_available=choice_autocomplete)
     @app_commands.describe(
         appointment_type="The type of minister appointment to view.",
-        all_or_available="Show full schedule or only available slots.", 
-        update="Default: False. Whether to update names via API or not. Will take some time if enabled."
+        all_or_available="Show full schedule or only available slots.",
     )
-    async def minister_list(self, interaction: discord.Interaction, appointment_type: str, all_or_available: str, update: bool = False):
+    async def minister_list(self, interaction: discord.Interaction, appointment_type: str, all_or_available: str):
         try:
             await interaction.response.defer()
 
@@ -1228,26 +1122,7 @@ class MinisterSchedule(commands.Cog):
             booked_times = {row[0]: (row[1], row[2]) for row in self.svs_cursor.fetchall()}
 
             if all_or_available == "all":
-                if update:
-                    async def update_progress(checked, total, waiting):
-                        if checked % 1 == 0:
-                            color = discord.Color.orange() if waiting else discord.Color.green()
-                            title = "waiting 60 seconds before continuing" if waiting else "Updating names"
-                            embed = discord.Embed(
-                                title=title,
-                                description=f"Checked {checked}/{total} minister appointees",
-                                color=color
-                            )
-                            try:
-                                await interaction.edit_original_response(embed=embed)
-                            except discord.NotFound:
-                                pass  # Interaction expired; nothing to do
-
-                    # Fetch updated data via API
-                    time_list, _ = await self.update_time_list(booked_times, update_progress)
-                else:
-                    # Use database method
-                    time_list, _ = self.generate_time_list(booked_times)
+                time_list, _ = self.generate_time_list(booked_times)
 
                 # Format the time list for the embed
                 time_list = "\n".join(time_list)

@@ -268,13 +268,13 @@ def render_info_message(channel_id: int) -> str:
     lines.append(f"{theme.warnIcon} **Before you upload**")
     lines.append(f"{theme.upperDivider}")
     lines.append(
-        "• One event at a time — upload all screenshots for a single event together. "
+        "• One event at a time. Upload all screenshots for a single event together. "
         "For Foundry/Canyon, include BOTH the registration mail AND the result mail "
         "in the same drop so the bot can match registered combatants to their scores."
     )
     lines.append("• Don't mix screenshots from different events in the same upload.")
     lines.append(
-        "• Include the header (with timestamp) of each screenshot — "
+        "• Include the header (with timestamp) of each screenshot. "
         "this is how the bot identifies the event and tells registration apart from results."
     )
     lines.append("• OCR isn't perfect; review and edit the parsed data before submitting.")
@@ -682,14 +682,14 @@ class OCRChannelEditView(discord.ui.View):
             for et in enabled_in_order:
                 lines.append(f"  • {EVENT_TYPES[et].label}")
         else:
-            lines.append("  *(none — channel won't process any screenshots)*")
+            lines.append("  *(none; channel won't process any screenshots)*")
         lines.append("└ Use the dropdown below to add or remove event types")
         lines.append("")
         lines.append(f"{theme.documentIcon} **Info message:** {info_state}")
         lines.append("└ Pinned helper message that explains how to upload screenshots")
         lines.append("")
         lines.append(f"{theme.lockIcon} **Uploaders:** {uploaders_state}")
-        lines.append("└ Per-alliance setting — applies to every Screenshot Upload "
+        lines.append("└ Per-alliance setting. Applies to every Screenshot Upload "
                      f"channel for `{_alliance_name(self.alliance_id)}`")
         lines.append("")
         lines.append(f"{theme.hourglassIcon} **Session timeout:** {timeout_min} min")
@@ -705,7 +705,7 @@ class OCRChannelEditView(discord.ui.View):
                      "finishes, keeping the channel clean")
         lines.append("")
         lines.append(f"{theme.editListIcon} **Edit Keywords**")
-        lines.append("└ Optional — only OCR on uploads whose message text contains "
+        lines.append("└ Optional. Only OCR on uploads whose message text contains "
                      "a keyword; blank = read every image (the default)")
         lines.append("")
         lines.append(f"{theme.trashIcon} **Remove Channel**")

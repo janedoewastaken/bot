@@ -4,6 +4,7 @@ EventReviewView auto-detects mode from which row lists are populated; partial
 sessions stay open so a later upload of the missing half enriches the record.
 """
 from __future__ import annotations
+import asyncio
 import logging
 import re
 import sqlite3
@@ -14,7 +15,6 @@ import discord
 
 from .pimp_my_bot import theme
 from .bear_track import _isolate_rtl, _ltr_line
-from .login_handler import LoginHandler
 from . import alliance_power_changes
 from .attendance_ocr_parsers import (
     EVENT_TYPES,
@@ -166,7 +166,7 @@ class EventReviewView(discord.ui.View):
             if new_fid:
                 notes.append(f"**{_isolate_rtl(old_disp)}** re-matched to **{_isolate_rtl(new_nick)}**.")
             else:
-                notes.append(f"**{_isolate_rtl(old_disp)}** now needs review - no other match found.")
+                notes.append(f"**{_isolate_rtl(old_disp)}** now needs review. No other match found.")
         return notes
 
     def _enrich_rows(self, raw_rows: list[dict], *, kind: str) -> list[dict]:
@@ -562,7 +562,7 @@ class EventReviewView(discord.ui.View):
             line = _ltr_line(" · ".join(bits))
             if budget_remaining - len(line) - 1 < 0:
                 desc_lines.append(f"_…and {len(page_rows) - rendered} more on this "
-                                  "page — open Edit a player row to see all_")
+                                  "page. Open Edit a player row to see all_")
                 return
             desc_lines.append(line)
             budget_remaining -= len(line) + 1
@@ -576,7 +576,7 @@ class EventReviewView(discord.ui.View):
         desc_lines.append(f"\n**{theme.deniedIcon} Unmatched rows · {total}**")
         if total == 0:
             desc_lines.append(
-                f"{theme.verifiedIcon} All rows are matched — nothing to assign."
+                f"{theme.verifiedIcon} All rows are matched. Nothing to assign."
             )
             return
         start = self.page * self.ROWS_PER_PAGE
@@ -596,7 +596,7 @@ class EventReviewView(discord.ui.View):
             line = _ltr_line(f"{theme.deniedIcon} `{name}` — {tail}")
             if budget_remaining - len(line) - 1 < 0:
                 desc_lines.append(
-                    f"_…and {total - (start + offset)} more — use the dropdown_"
+                    f"_…and {total - (start + offset)} more. Use the dropdown_"
                 )
                 return
             desc_lines.append(line)
@@ -616,20 +616,20 @@ class EventReviewView(discord.ui.View):
             if needs_review:
                 bits.append(f"{needs_review} needs review")
             if unmatched:
-                bits.append(f"{unmatched} unmatched — use Edit a player row to assign")
+                bits.append(f"{unmatched} unmatched: use Edit a player row to assign")
             if low_conf:
-                bits.append(f"{low_conf} low-confidence — verify before submit")
+                bits.append(f"{low_conf} low-confidence: verify before submit")
             if absent:
                 bits.append(f"{absent} will be marked Absent")
             return bits
 
         unmatched = sum(1 for r in self.all_rows if not r["fid"])
-        low_conf = sum(1 for r in self.all_rows if r["status"] == "review")
+        low_conf = sum(1 for r in self.all_rows if r["status"] in ("likely", "review"))
         absent_count = self._would_be_absent_count()
         if unmatched:
-            bits.append(f"{unmatched} unmatched — use Edit a player row to assign")
+            bits.append(f"{unmatched} unmatched: use Edit a player row to assign")
         if low_conf:
-            bits.append(f"{low_conf} low-confidence — verify before submit")
+            bits.append(f"{low_conf} low-confidence: verify before submit")
         if absent_count:
             bits.append(f"{absent_count} will be marked Absent")
         return bits
@@ -1330,7 +1330,7 @@ class EventReviewView(discord.ui.View):
         if unmatched:
             desc.append(
                 f"{theme.warnIcon} `{len(unmatched)}` unmatched row"
-                f"{'s' if len(unmatched) != 1 else ''} skipped — re-upload to assign them."
+                f"{'s' if len(unmatched) != 1 else ''} skipped. Re-upload to assign them."
             )
         if matched:
             last_ts = getattr(self, "_last_ts", None)
@@ -1390,8 +1390,8 @@ class EventReviewView(discord.ui.View):
 
         desc = [f"{theme.upperDivider}"]
         if self.mode == "registration":
-            desc.append(f"{theme.warnIcon} Saved as **registration only** — "
-                        "event will close when the result mail is uploaded.\n")
+            desc.append(f"{theme.warnIcon} Saved as **registration only**. "
+                        "Event will close when the result mail is uploaded.\n")
         if self.session.alliance_rank is not None:
             desc.append(f"**{theme.crownIcon} Alliance ranked No. {self.session.alliance_rank}**\n")
 
@@ -1442,7 +1442,7 @@ class EventReviewView(discord.ui.View):
         if is_registration_only:
             line = f"`{len(self.registered_rows)}` combatants in the registration mail"
             if reg_unmatched:
-                line += (f" — `{len(matched_reg)}` matched to roster, "
+                line += (f": `{len(matched_reg)}` matched to roster, "
                          f"`{reg_unmatched}` unmatched")
             analytics_lines.append(line)
         elif absent_count:
@@ -1456,7 +1456,7 @@ class EventReviewView(discord.ui.View):
 
         if needs_review_count and not is_registration_only:
             analytics_lines.append(
-                f"{theme.warnIcon} `{needs_review_count}` row(s) need review — "
+                f"{theme.warnIcon} `{needs_review_count}` row(s) need review: "
                 "present without a matching registration"
             )
 
@@ -1555,66 +1555,63 @@ class _ConfirmDeleteEventView(discord.ui.View):
 
 async def _resolve_player_field(interaction: discord.Interaction,
                                 view: "EventReviewView", text: str):
-    """Resolve an ID or name to (fid, nickname, status, note). An ID not in the
-    roster is looked up via the player API (like /w); `note` is an ephemeral
-    message for the caller to surface."""
+    """Resolve an ID or name to (fid, nickname, status, note). An ID not in the roster is
+    confirmed against the alliance's state and added with a placeholder name (names can't be
+    looked up anymore); `note` is an ephemeral message for the caller to surface."""
     text = (text or "").strip()
     if text.isdigit():
         fid = int(text)
         nick = view._lookup_nickname(fid)
         if nick:
             return fid, nick, "manual", f"{theme.verifiedIcon} Matched ID `{fid}` to **{_isolate_rtl(nick)}**."
-        # Not in the roster — pull the name from the player API.
+        # Not in the roster - confirm against the alliance's state and add as 'Player <fid>'.
         if not interaction.response.is_done():
             await interaction.response.defer()
-        try:
-            result = await LoginHandler().fetch_player_data(str(fid))
-        except Exception as e:
-            logger.error(f"Attendance player lookup failed for {fid}: {e}")
-            print(f"[ERROR] Attendance player lookup failed for {fid}: {e}")
-            return fid, None, "no_match", f"{theme.deniedIcon} Lookup failed for ID `{fid}` — try again shortly."
-        if result.get("status") == "success" and result.get("data"):
-            nick = result["data"].get("nickname") or str(fid)
-            state = _ensure_player_in_alliance(fid, result["data"], view.session.alliance_id)
+        added, nick, note = await _add_unknown_fid(interaction, view, fid)
+        if added:
             view.roster = load_alliance_roster(view.session.alliance_id)
-            disp = _isolate_rtl(nick)
-            if state == "added":
-                note = f"{theme.verifiedIcon} Added **{disp}** (ID `{fid}`) to the alliance and matched the row."
-            elif state == "other_alliance":
-                note = f"{theme.warnIcon} Matched ID `{fid}` to **{disp}** — already in another alliance, not moved."
-            else:
-                note = f"{theme.verifiedIcon} Matched ID `{fid}` to **{disp}**."
             return fid, nick, "manual", note
-        reason = {"rate_limited": "API rate limit reached — try again shortly.",
-                  "not_found": f"No player found with ID `{fid}`."}.get(
-            result.get("status") or "", "Lookup failed.")
-        return fid, None, "no_match", f"{theme.deniedIcon} {reason}"
+        return fid, None, "no_match", note
     if text:
         f, st = fuzzy_match_name(text, view.roster, alliance_id=view.session.alliance_id)
         if f is not None:
             nick = view._lookup_nickname(f)
             return f, nick, st, f"{theme.verifiedIcon} Matched to **{_isolate_rtl(nick or text)}**."
         return None, None, "no_match", (
-            f"{theme.warnIcon} No player matched `{text}` — left unmatched.")
+            f"{theme.warnIcon} No player matched `{text}`. Left unmatched.")
     return None, None, "no_match", None
 
 
-def _ensure_player_in_alliance(fid: int, data: dict, alliance_id) -> str:
-    """Add a looked-up player to this alliance if untracked. Returns 'added',
-    'exists', or 'other_alliance' — never moves a player from another alliance."""
-    nick = data.get("nickname") or str(fid)
+async def _add_unknown_fid(interaction, view, fid):
+    """Confirm an unknown fid against the alliance's state (one probe) and add it with a
+    placeholder name. Returns (added, nickname, note). Never moves a player from another alliance."""
+    from . import gift_state_resolver
+    alliance_id = view.session.alliance_id
     with sqlite3.connect("db/users.sqlite", timeout=30.0) as conn:
         row = conn.execute("SELECT alliance FROM users WHERE fid = ?", (fid,)).fetchone()
-        if row is not None:
-            return "exists" if str(row[0]) == str(alliance_id) else "other_alliance"
+    if row is not None:
+        if str(row[0]) == str(alliance_id):
+            return False, None, f"{theme.warnIcon} ID `{fid}` is already in this alliance."
+        return False, None, f"{theme.warnIcon} ID `{fid}` is in another alliance. Not moved."
+    gift_cog = interaction.client.get_cog("GiftOperations")
+    if gift_cog is None:
+        return False, None, f"{theme.deniedIcon} Gift Codes is unavailable, so I can't verify ID `{fid}`."
+    alliance_kid = await asyncio.to_thread(gift_state_resolver.get_alliance_kid, alliance_id)
+    if alliance_kid is None:
+        return False, None, (f"{theme.warnIcon} This alliance has no state set, so I can't confirm ID `{fid}`. "
+                             f"Add them under Alliance Management first.")
+    kid, verified = await gift_state_resolver.verify_add_state(gift_cog, fid, alliance_id)
+    if not verified:
+        return False, None, (f"{theme.deniedIcon} Couldn't confirm ID `{fid}` in state `{alliance_kid}`. "
+                             f"They may be in another state, or the ID is wrong. Add them under Alliance Management first.")
+    nick = f"Player {fid}"
+    with sqlite3.connect("db/users.sqlite", timeout=30.0) as conn:
         conn.execute(
             "INSERT INTO users (fid, nickname, furnace_lv, kid, stove_lv_content, alliance) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (fid, nick, data.get("stove_lv", 0), str(data.get("kid", "")),
-             data.get("stove_lv_content", ""), str(alliance_id)),
-        )
+            "VALUES (?, ?, 0, ?, '', ?)",
+            (fid, nick, str(kid), str(alliance_id)))
         conn.commit()
-        return "added"
+    return True, nick, f"{theme.verifiedIcon} Added **{nick}** (ID `{fid}`) to the alliance and matched the row."
 
 
 class _EditMergedRowModal(discord.ui.Modal):
@@ -1742,7 +1739,8 @@ class _EditRowModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction):
         if not self.player_input.value.strip():
-            del self.bucket[self.local_idx]
+            if self.local_idx is not None and self.local_idx < len(self.bucket):
+                del self.bucket[self.local_idx]
             await self.view._save_edit(interaction)
             return
         value = _parse_value_input(self.value_input.value)
@@ -1754,10 +1752,12 @@ class _EditRowModal(discord.ui.Modal):
 
         fid, nickname, status, note = await _resolve_player_field(
             interaction, self.view, self.player_input.value)
-        # Update in place so the original OCR name (alias key) and _kind survive.
-        self.bucket[self.local_idx].update(
-            {"value": value, "fid": fid, "nickname": nickname, "status": status})
-        displaced = self.view._apply_fid_collision(self.bucket, self.local_idx, fid) if fid else []
+        displaced = []
+        if self.local_idx is not None and self.local_idx < len(self.bucket):
+            # Update in place so the original OCR name (alias key) and _kind survive.
+            self.bucket[self.local_idx].update(
+                {"value": value, "fid": fid, "nickname": nickname, "status": status})
+            displaced = self.view._apply_fid_collision(self.bucket, self.local_idx, fid) if fid else []
         await self.view._save_edit(interaction)
         messages = []
         if note and self.player_input.value.strip() != self._orig_player:

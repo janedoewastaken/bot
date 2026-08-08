@@ -151,6 +151,14 @@ if sys.prefix == sys.base_prefix and not should_skip_venv():
             startup.phase_start("Setting up virtual environment")
             subprocess.check_call([sys.executable, "-m", "venv", venv_path], timeout=300)
 
+            # 3.12+ venvs seed only pip; source builds need setuptools.
+            try:
+                subprocess.run([venv_python_name, "-m", "pip", "install", "--upgrade",
+                                "setuptools", "wheel"], timeout=300,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+
             if sys.platform == "win32":
                 startup.venv_instructions(venv_python_name, sys.platform)
                 sys.exit(0)
@@ -248,6 +256,58 @@ def _requirement_name(spec):
         spec = spec.split(sep)[0]
     return spec
 
+
+# OCR-only: the bot boots fine without these (OCR just switches off) if they won't install.
+OPTIONAL_PACKAGES = {"onnxruntime", "rapidocr"}
+
+
+def _pip_install_one(package, *, retries=1):
+    """Install one requirement, retrying once for transient failures. Returns (ok, output_tail)."""
+    import time
+    cmd = [sys.executable, "-m", "pip", "install", package, "--no-cache-dir"]
+    if break_system_packages_arg():
+        cmd.append("--break-system-packages")
+    tail = []
+    for attempt in range(retries + 1):
+        if attempt:
+            time.sleep(3)  # give a transient lock a moment to clear before retrying
+        try:
+            result = subprocess.run(cmd, timeout=1200, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True, env=_pip_env())
+            if result.returncode == 0:
+                return True, []
+            tail = (result.stdout or "").strip().splitlines()[-15:]
+        except Exception as e:
+            tail = [str(e)]
+    return False, tail
+
+
+def _install_requirements_individually(requirements_txt_path):
+    """Per-package fallback after a batch failure; optional OCR packages degrade to a warning. Returns False only on an essential package."""
+    try:
+        with open(requirements_txt_path, "r") as f:
+            packages = [ln.strip() for ln in f
+                        if ln.strip() and not ln.strip().startswith("#")]
+    except OSError as e:
+        startup.phase_fail("Update failed", details=[f"Could not read requirements: {e}"],
+                           fix="pip install -r requirements.txt")
+        return False
+
+    for package in packages:
+        ok, tail = _pip_install_one(package)
+        if ok:
+            continue
+        if _requirement_name(package).lower() in OPTIONAL_PACKAGES:
+            startup.warn(f"Could not install {_requirement_name(package)} - screenshot reading (OCR) "
+                         f"will be off. Everything else works. "
+                         f"Set an External OCR Service under Bear Tracking to re-enable it.")
+            continue
+        startup.phase_fail("Update failed",
+                           details=[f"Failed to install {package}:", *tail],
+                           fix="pip install -r requirements.txt")
+        return False
+    return True
+
 def calculate_file_hash(filepath):
     """Calculate SHA256 hash of a file."""
     import hashlib
@@ -284,7 +344,9 @@ def cleanup_removed_packages():
             pass
         return result
 
-    removed = _read_pkgs("requirements.old") - _read_pkgs("requirements.txt")
+    # Never uninstall the build toolchain - removing setuptools wedged updates once.
+    PROTECTED = {"setuptools", "pip", "wheel"}
+    removed = _read_pkgs("requirements.old") - _read_pkgs("requirements.txt") - PROTECTED
     if removed:
         debug = "--verbose" in sys.argv or "--debug" in sys.argv
         print(f"Found {len(removed)} packages to remove from requirements: {', '.join(removed)}")
@@ -480,30 +542,19 @@ def check_and_install_requirements():
 
     if missing_packages: # Install missing packages
         startup.phase_start("Installing missing packages")
-
         for package in missing_packages:
-            package_name = _requirement_name(package)
-
-            try:
-                cmd = [sys.executable, "-m", "pip", "install", package, "--no-cache-dir"]
-
-                if break_system_packages_arg():
-                    cmd.append("--break-system-packages")
-
-                # Capture output so a failure shows pip's real reason (no wheel for
-                # this Python/arch, OOM kill, disk full) instead of a bare exit code.
-                result = subprocess.run(cmd, timeout=1200, stdout=subprocess.PIPE,
-                                        stderr=subprocess.STDOUT, text=True, env=_pip_env())
-                if result.returncode != 0:
-                    tail = (result.stdout or "").strip().splitlines()[-15:]
-                    startup.phase_fail("Dependencies failed",
-                                       details=[f"Failed to install {package} (pip exit {result.returncode}):", *tail],
-                                       fix="pip install -r requirements.txt")
-                    return False
-
-            except Exception as e:
-                startup.phase_fail("Dependencies failed", details=[f"Failed to install {package}: {e}"], fix="pip install -r requirements.txt")
-                return False
+            ok, tail = _pip_install_one(package)
+            if ok:
+                continue
+            if _requirement_name(package).lower() in OPTIONAL_PACKAGES:
+                startup.warn(f"Could not install {_requirement_name(package)} - screenshot reading (OCR) "
+                             f"will be off. Everything else works. "
+                             f"Set an External OCR Service under Bear Tracking to re-enable it.")
+                continue
+            startup.phase_fail("Dependencies failed",
+                               details=[f"Failed to install {package}:", *tail],
+                               fix="pip install -r requirements.txt")
+            return False
 
     startup.phase_ok("Dependencies satisfied")
     return True
@@ -628,6 +679,38 @@ except ImportError:
 except Exception:
     pass  # SSL patch error, continue anyway
 
+def raise_open_file_limit(floor=1024, target=4096):
+    """Raise a too-low FD limit (macOS defaults to 256) so SQLite can't fail with 'unable to open database file'. No-op on Windows and on already-healthy limits (>=floor)."""
+    try:
+        import resource
+    except ImportError:
+        return  # Windows has no RLIMIT_NOFILE
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except Exception:
+        return
+    if soft == resource.RLIM_INFINITY or soft >= floor:
+        return  # already comfortable - don't touch healthy limits
+    ceiling = target if hard == resource.RLIM_INFINITY else min(target, hard)
+    new_soft = soft
+    for candidate in (ceiling, 2048, 1024):
+        if candidate <= soft:
+            break
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (candidate, hard))
+            new_soft = candidate
+            break
+        except (ValueError, OSError):
+            continue
+    if new_soft > soft:
+        startup.info(f"Raised open-file limit {soft} -> {new_soft} (macOS default 256 is too low).")
+    if new_soft < floor:
+        startup.warn(
+            f"Open-file limit is only {new_soft}, which can make the database "
+            "intermittently unreadable. Start the bot from a terminal after: ulimit -n 4096"
+        )
+
+
 if __name__ == "__main__":
     # ── Proxy support (--proxy flag) ───────────────────────────────────────────
     # Pass --proxy <url> to route all game API traffic through a proxy server.
@@ -681,21 +764,26 @@ if __name__ == "__main__":
     def install_packages(requirements_txt_path: str, debug: bool = False) -> bool:
         """Install packages from requirements.txt file using pip install -r."""
         full_command = [sys.executable, "-m", "pip", "install", "-r", requirements_txt_path, "--no-cache-dir"]
-        
+
         if break_system_packages_arg():
             full_command.append("--break-system-packages")
-        
+
         try:
             if debug:
                 subprocess.check_call(full_command, timeout=1200, env=_pip_env())
-            else:
-                subprocess.check_call(full_command, timeout=1200, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_pip_env())
-            return True
-        except Exception as e:
-            if debug:
-                print(f"Failed to install requirements: {e}")
-            return False
-    
+                return True
+            # Capture output so a failure shows pip's reason, not a bare exit code.
+            result = subprocess.run(full_command, timeout=1200, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True, env=_pip_env())
+            if result.returncode == 0:
+                return True
+        except Exception:
+            pass  # fall through to the per-package retry below
+
+        # Retry each package alone so one locked/unbuildable OCR dep doesn't sink the update.
+        startup.warn("Some requirements didn't install in one pass - retrying them individually.")
+        return _install_requirements_individually(requirements_txt_path)
+
     async def check_and_update_files():
         beta_mode = "--beta" in sys.argv
         repair_mode = "--repair" in sys.argv
@@ -843,7 +931,7 @@ if __name__ == "__main__":
                                 # Now cleanup removed packages (comparing old vs new)
                                 cleanup_removed_packages()
                             else:
-                                startup.phase_fail("Update failed", details=["Failed to install requirements"])
+                                # install_packages already reported pip's real error.
                                 return
                             
                             # Remove the requirements.txt from update folder after copying
@@ -857,15 +945,15 @@ if __name__ == "__main__":
                                 src_path = os.path.join(root, file)
                                 rel_path = os.path.relpath(src_path, update_dir)
                                 dst_path = os.path.join(".", rel_path)
-                                
+                                norm_path = dst_path.replace("\\", "/")
+
                                 # Skip certain files that shouldn't be overwritten
-                                if file in ["bot_token.txt", "version"] or dst_path.startswith("db/") or dst_path.startswith("db\\"):
+                                if file in ["bot_token.txt", "version"] or norm_path.startswith("db/") or norm_path.startswith("./db/"):
                                     continue
-                                
+
                                 os.makedirs(os.path.dirname(dst_path), exist_ok=True)
 
                                 # Only backup cogs Python files (.py extension)
-                                norm_path = dst_path.replace("\\", "/")
                                 is_cogs_file = (norm_path.startswith("cogs/") or norm_path.startswith("./cogs/")) and file.endswith(".py")
                                 
                                 if is_cogs_file and os.path.exists(dst_path):
@@ -1071,6 +1159,7 @@ if __name__ == "__main__":
         "conn_changes": "db/changes.sqlite",
         "conn_users": "db/users.sqlite",
         "conn_settings": "db/settings.sqlite",
+        "conn_id_channel": "db/id_channel.sqlite",
     }
 
     connections = {name: sqlite3.connect(path) for name, path in databases.items()}
@@ -1203,6 +1292,7 @@ if __name__ == "__main__":
                 ("discord_id",              "INTEGER"),
                 ("discord_server_id",       "INTEGER"),
                 ("discord_id_updated_at",   "TEXT"),
+                ("state_mismatch_at",       "TEXT"),
             ]
             for _col, _typ in _users_columns_to_add:
                 try:
@@ -1232,12 +1322,45 @@ if __name__ == "__main__":
             if "last_attempt_at" not in uc_cols:
                 conn_giftcode.execute("ALTER TABLE user_giftcodes ADD COLUMN last_attempt_at TEXT")
 
+        with connections["conn_id_channel"] as conn_id_channel:
+            conn_id_channel.execute("""CREATE TABLE IF NOT EXISTS id_channels (
+                guild_id INTEGER,
+                alliance_id INTEGER,
+                channel_id INTEGER,
+                created_at TEXT,
+                created_by INTEGER,
+                UNIQUE(guild_id, channel_id)
+            )""")
+            # Tracks the standing info message so it can be edited instead of reposted.
+            _idc_cols = {r[1] for r in conn_id_channel.execute("PRAGMA table_info(id_channels)")}
+            if "info_message_id" not in _idc_cols:
+                conn_id_channel.execute("ALTER TABLE id_channels ADD COLUMN info_message_id INTEGER")
+
         with connections["conn_alliance"] as conn_alliance:
             conn_alliance.execute("""CREATE TABLE IF NOT EXISTS alliancesettings (
                 alliance_id INTEGER PRIMARY KEY,
                 channel_id INTEGER,
                 interval INTEGER
             )""")
+
+            # Per-alliance toggle: auto-remove a member detected (at gift redemption)
+            # to have left this single-state alliance's state. Off by default.
+            try:
+                conn_alliance.execute("SELECT auto_remove_on_transfer FROM alliancesettings LIMIT 1")
+            except sqlite3.OperationalError:
+                conn_alliance.execute(
+                    "ALTER TABLE alliancesettings ADD COLUMN auto_remove_on_transfer INTEGER DEFAULT 0"
+                )
+
+            # Per-alliance ID channel info message: post it, and pin it. Posting is
+            # off by default so an update never writes into an existing channel.
+            for _col, _default in (("id_post_info_message", "0"), ("id_pin_info_message", "1")):
+                try:
+                    conn_alliance.execute(f"SELECT {_col} FROM alliancesettings LIMIT 1")
+                except sqlite3.OperationalError:
+                    conn_alliance.execute(
+                        f"ALTER TABLE alliancesettings ADD COLUMN {_col} INTEGER DEFAULT {_default}"
+                    )
 
             # Per-alliance gate for who can upload screenshots in the
             # Screenshot Upload channels (0 = anyone, 1 = bot admins only).
@@ -1275,6 +1398,46 @@ if __name__ == "__main__":
                     "ALTER TABLE alliancesettings ADD COLUMN ocr_session_timeout_min INTEGER DEFAULT 15"
                 )
 
+            # Sync Log is gone - inherit it as the redemption log, once only.
+            with connections["conn_settings"] as _cs:
+                _cs.execute("""CREATE TABLE IF NOT EXISTS bot_global_settings (
+                    setting_key TEXT PRIMARY KEY, setting_value TEXT)""")
+                _done = _cs.execute(
+                    "SELECT 1 FROM bot_global_settings WHERE setting_key = 'sync_log_migrated'"
+                ).fetchone()
+            if not _done:
+                conn_alliance.execute(
+                    "UPDATE alliancesettings SET redemption_channel_id = channel_id "
+                    "WHERE redemption_channel_id IS NULL AND channel_id IS NOT NULL"
+                )
+                with connections["conn_settings"] as _cs:
+                    _cs.execute(
+                        "INSERT OR REPLACE INTO bot_global_settings VALUES ('sync_log_migrated', '1')"
+                    )
+
+            # Fallback to giftcode channel for upgrades from v1.x which posted redemption progress there
+            with connections["conn_settings"] as _cs:
+                _giftfb_done = _cs.execute(
+                    "SELECT 1 FROM bot_global_settings WHERE setting_key = 'redeem_channel_gift_fallback'"
+                ).fetchone()
+            if not _giftfb_done:
+                try:
+                    _gift_channels = connections["conn_giftcode"].execute(
+                        "SELECT alliance_id, channel_id FROM giftcode_channel WHERE channel_id IS NOT NULL"
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    _gift_channels = []   # table absent on a fresh install
+                for _aid, _cid in _gift_channels:
+                    conn_alliance.execute(
+                        "UPDATE alliancesettings SET redemption_channel_id = ? "
+                        "WHERE alliance_id = ? AND redemption_channel_id IS NULL",
+                        (_cid, _aid),
+                    )
+                with connections["conn_settings"] as _cs:
+                    _cs.execute(
+                        "INSERT OR REPLACE INTO bot_global_settings VALUES ('redeem_channel_gift_fallback', '1')"
+                    )
+
             conn_alliance.execute("""CREATE TABLE IF NOT EXISTS alliance_list (
                 alliance_id INTEGER PRIMARY KEY,
                 name TEXT,
@@ -1297,11 +1460,12 @@ if __name__ == "__main__":
                 conn_alliance.execute("ALTER TABLE alliance_list ADD COLUMN state_locked INTEGER DEFAULT 0")
                 conn_alliance.execute("UPDATE alliance_list SET state_locked = 1 WHERE kid IS NOT NULL")
 
+    raise_open_file_limit()
     create_tables()
     startup.phase_ok("Database ready")
 
     async def load_cogs():
-        cogs = ["pimp_my_bot", "process_queue", "onnx_lifecycle", "bot_main_menu", "alliance_sync", "alliance", "alliance_member_operations", "bot_operations", "alliance_logs", "bot_support", "bot_health", "gift_operations", "alliance_history", "alliance_w_command", "bot_startup", "notification_system", "notification_schedule", "alliance_id_channel", "alliance_channels", "bot_backup", "notification_editor", "notification_templates", "notification_wizard", "attendance", "attendance_report", "attendance_ocr", "minister_schedule", "minister_menu", "minister_archive", "alliance_registration", "bear_track"]
+        cogs = ["pimp_my_bot", "process_queue", "onnx_lifecycle", "bot_main_menu", "alliance", "alliance_member_operations", "bot_operations", "alliance_logs", "bot_support", "bot_health", "gift_operations", "alliance_history", "alliance_w_command", "bot_startup", "notification_system", "notification_schedule", "alliance_id_channel", "alliance_channels", "bot_backup", "notification_editor", "notification_templates", "notification_wizard", "attendance", "attendance_report", "attendance_ocr", "minister_schedule", "minister_menu", "minister_archive", "alliance_registration", "bear_track"]
 
         failed_cogs = []
 
@@ -1372,7 +1536,9 @@ if __name__ == "__main__":
                     if health is not None:
                         result = await health.check_wos_api_status()
                         ok = result.get("status") in ("healthy", "warning")
-                        startup.api_status("Gift Code Redemption API", "ok" if ok else "error", result.get("message"))
+                        detail = result.get("message")   # "Online" is implied by "Connected to"
+                        startup.api_status("Gift Code Redemption API", "ok" if ok else "error",
+                                           None if detail == "Online" else detail)
                     else:
                         startup.api_status("Gift Code Redemption API", "error", "Health cog not loaded")
                 except Exception:
