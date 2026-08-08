@@ -69,14 +69,23 @@ EVENT_TYPES: dict[str, EventTypeConfig] = {
         default_keywords=("Canyon Clash", "Canyon"),
         fingerprint_re_by_kind={
             "registration": re.compile(
-                _REGISTRATION_MARKERS + r".*?Canyon",
+                r"(?:"
+                + _REGISTRATION_MARKERS + r".*?Canyon"
+                # OCR sometimes drops spaces / reads the title before the
+                # combatant sentence — still a registration mail.
+                r"|\[?\s*Canyon\s*Clash\s*\]?.{0,120}(?:"
+                r"selected\s+as\s+a?\s*combatant"
+                r"|Combatants:\s*\d+\s*/\s*\d+"
+                r"|Legionnaires?\s+of\s+your\s+Legion)"
+                r")",
                 re.IGNORECASE | re.DOTALL,
             ),
             # Result-anchors avoid bare "Canyon Clash" which also appears in registration mails.
+            # Keep spacing optional: OCR often emits "No.3 in[Canyon".
             "result": re.compile(
                 r"(?:Total\s+Fuel\s+Used"
                 r"|Personal\s+Point\s+Ranking"
-                r"|ranked\s+No\.?\s*\d+\s+in\s+\[Canyon)",
+                r"|ranked\s+No\.?\s*\d+\s*in\s*\[?\s*Canyon)",
                 re.IGNORECASE,
             ),
         },
@@ -132,6 +141,28 @@ def detect_kind(event_type: str, ocr_text: str) -> Optional[str]:
     for kind, regex in cfg.fingerprint_re_by_kind.items():
         if regex.search(ocr_text):
             return kind
+    return None
+
+
+_REG_SCROLL_HINT_RE = re.compile(
+    r"\bR[1-5]\b.*\d+(?:[.,]\d+)?[MBmb]\b|\d+(?:[.,]\d+)?[MBmb]\b.*\bR[1-5]\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_RESULT_SCROLL_HINT_RE = re.compile(r"\d{1,3}(?:,\d{3}){1,}")
+
+
+def infer_kind(event_type: str, ocr_text: str) -> Optional[str]:
+    """Fingerprint first; for scroll pages, use layout hints so registration
+    power lists (R3 + 745.6M) aren't treated as result points (688,183)."""
+    kind = detect_kind(event_type, ocr_text)
+    if kind is not None:
+        return kind
+    if not ocr_text:
+        return None
+    if _REG_SCROLL_HINT_RE.search(ocr_text):
+        return "registration"
+    if _RESULT_SCROLL_HINT_RE.search(ocr_text):
+        return "result"
     return None
 
 
@@ -1985,6 +2016,25 @@ def _unmatched_id_floor(session_id: str) -> int:
 
 # ── base session class ────────────────────────────────────────────────────
 
+class _CachedAttachment:
+    """Attachment stand-in whose bytes were already downloaded.
+
+    Lets the Discord source message be deleted (auto_delete_screenshots)
+    without racing the background OCR task's `att.read()`."""
+
+    __slots__ = ("filename", "content_type", "size", "url", "_data")
+
+    def __init__(self, att: discord.Attachment, data: bytes):
+        self.filename = att.filename
+        self.content_type = att.content_type
+        self.size = len(data)
+        self.url = getattr(att, "url", None)
+        self._data = data
+
+    async def read(self) -> bytes:
+        return self._data
+
+
 class OcrUploadSession:
     """Generic OCR upload session: collects screenshots, runs subclass-provided parsing/review."""
 
@@ -2045,14 +2095,32 @@ class OcrUploadSession:
         await self.add_attachments(attachments)
 
     async def add_attachments(self, attachments: list[discord.Attachment]):
-        self.known_total_images += len(attachments)
+        # Read bytes NOW, before the caller deletes the Discord message
+        # (auto_delete_screenshots). Otherwise the background OCR task races
+        # the delete and att.read() fails/hangs — only the first header page
+        # survives and registration looks like "~8 combatants".
+        cached: list[_CachedAttachment] = []
+        for att in attachments:
+            try:
+                data = await att.read()
+            except Exception:
+                logger.exception(
+                    "OcrUploadSession: failed to download attachment %s",
+                    getattr(att, "filename", "?"),
+                )
+                continue
+            if data:
+                cached.append(_CachedAttachment(att, data))
+        if not cached:
+            return
+        self.known_total_images += len(cached)
         if self.progress_message is not None:
             await self.render_progress()
-        self.image_attachments.extend(attachments)
+        self.image_attachments.extend(cached)
         self.restart_timer()
-        asyncio.create_task(self._run_attachment_batch(attachments))
+        asyncio.create_task(self._run_attachment_batch(cached))
 
-    async def _run_attachment_batch(self, attachments: list[discord.Attachment]):
+    async def _run_attachment_batch(self, attachments: list):
         """Process OCR off the hot path so button interactions can defer promptly."""
         async with self._lock:
             try:
@@ -2772,8 +2840,11 @@ class _PointsSession(OcrUploadSession):
                 self.processed_images += 1
                 continue
 
-            # Scroll pages match no fingerprint — inherit the last classified kind.
-            kind = detect_kind(self.db_event_type, text)
+            # Fingerprint → scroll-page hints (R3+745.6M vs 688,183) → last kind.
+            # Never blindly default scroll pages to "result": Discord sends
+            # attachments in arbitrary order and a result page first would then
+            # swallow the whole registration list into result_rows.
+            kind = infer_kind(self.db_event_type, text)
             if kind is None:
                 kind = self._last_kind or "result"
             else:
@@ -2980,7 +3051,7 @@ class CanyonClashSession(_PointsSession):
 # ── Alliance Showdown session ─────────────────────────────────────────────
 
 _ALLIANCE_RANK_RE = re.compile(
-    r"(?:rank(?:ed|ing)?\s+No\.?\s+|Alliance\s+Rank(?:ing)?[:\s]+)(\d{1,3})",
+    r"(?:rank(?:ed|ing)?\s+No\.?\s*|Alliance\s+Rank(?:ing)?[:\s]+)(\d{1,3})",
     re.IGNORECASE,
 )
 _FOUNDRY_WIN_RE = re.compile(r"\b(?:prevailed|victory|congratulations)\b", re.IGNORECASE)

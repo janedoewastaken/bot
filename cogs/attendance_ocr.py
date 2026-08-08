@@ -250,11 +250,13 @@ class AttendanceOCR(commands.Cog):
                 await message.channel.send(
                     f"{theme.warnIcon} Couldn't identify the event in that screenshot.\n"
                     f"This channel accepts: **{enabled_labels}**\n"
-                    f"If your screenshot is for one of these, the bot's text "
-                    f"recognition may have misread it. Try a clearer screenshot, "
-                    f"or ask an admin to add the missing event type if your "
-                    f"screenshot is for something else.",
-                    delete_after=30,
+                    f"Include at least one **mail header** in the same upload "
+                    f"(the page with **Congratulations** / the event name, or "
+                    f"**Personal Point Ranking** / **Total Fuel Used**). "
+                    f"Scroll-only pages aren't enough to tell events apart.\n"
+                    f"If the header is there and it still fails, the bot's text "
+                    f"recognition may have misread it — try a clearer screenshot.",
+                    delete_after=45,
                 )
                 return
 
@@ -272,6 +274,12 @@ class AttendanceOCR(commands.Cog):
                 return
 
             self.active_sessions[key] = new_session
+            # Seed kind from the classifying image. Discord attachment order is
+            # arbitrary — if a result scroll page is first, scroll registration
+            # pages would otherwise inherit kind=result and dump Power rows into
+            # the results list (~50 "players").
+            if hasattr(new_session, "_last_kind") and classification:
+                new_session._last_kind = classification[1]
             await new_session.start(images, status_message=status_message)
             await self._maybe_delete_source(message, settings)
 

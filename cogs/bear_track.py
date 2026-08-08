@@ -249,6 +249,11 @@ def _rejoin_spaced_thousands(m) -> str:
     return re.sub(r'[ \t]+', sep, s)
 
 
+# Compact power/points suffixes (1.2B, 926.6M). Must stay intact: the digit-map
+# treats bare 'B' as '8', which turns "1.2B" into "1.28" and drops the player.
+_COMPACT_MAGNITUDE_RE = re.compile(r'(?<![\w.])(\d+(?:[.,]\d+)?)([KMBkmb])\b')
+
+
 def repair_ocr_digits(text: str) -> str:
     text = text.translate(_FULLWIDTH_PUNCT)
     # OCR often reads a thousands separator as a space ('663,240 667'), which
@@ -257,13 +262,22 @@ def repair_ocr_digits(text: str) -> str:
     # same-line only so a value never absorbs the next row.
     text = _SPACED_THOUSANDS_RE.sub(_rejoin_spaced_thousands, text)
     text = _BARE_DAMAGE_RUN_RE.sub(lambda m: f'{int(m.group(1)):,}', text)
+    # Shield compact magnitudes before B→8 (and friends) remapping.
+    held: list[str] = []
+    def _hold(m):
+        held.append(m.group(0))
+        return f'\x00MAG{len(held) - 1}\x00'
+    text = _COMPACT_MAGNITUDE_RE.sub(_hold, text)
     def _fix(match):
         run = match.group(0)
         digits = sum(c.isdigit() for c in run)
         if digits == 0 or (len(run) >= 6 and digits <= 1):
             return run
         return ''.join(_OCR_DIGIT_MAP.get(c, c) for c in run)
-    return _OCR_DIGIT_RUN.sub(_fix, text)
+    text = _OCR_DIGIT_RUN.sub(_fix, text)
+    for i, orig in enumerate(held):
+        text = text.replace(f'\x00MAG{i}\x00', orig)
+    return text
 
 
 _FORMATTED_NUMBER_RE = re.compile(r'\d{1,3}(?:[,\.]\d{3})+')
